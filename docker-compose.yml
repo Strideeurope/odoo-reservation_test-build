@@ -3,7 +3,7 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: odoo
-      POSTGRES_PASSWORD: CHANGE_ME
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: postgres
     volumes:
       - odoo-db-data:/var/lib/postgresql/data
@@ -18,7 +18,7 @@ services:
     environment:
       HOST: db
       USER: odoo
-      PASSWORD: CHANGE_ME
+      PASSWORD: ${DB_PASSWORD}
     volumes:
       - odoo-web-data:/var/lib/odoo
       - ./addons:/mnt/extra-addons

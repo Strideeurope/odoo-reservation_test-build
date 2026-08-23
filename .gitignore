@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# Real local secrets — tracked templates are the .example versions instead.
+.env
+config/odoo.conf
+Caddyfile
