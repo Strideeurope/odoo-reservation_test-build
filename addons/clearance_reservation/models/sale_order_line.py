@@ -77,6 +77,7 @@ class SaleOrderLine(models.Model):
 
     @api.depends(
         "order_id.pick_scheduled_date", "order_id.is_reservation_hard_locked",
+        "order_id.fulfillment_stage",
         "is_reservation_hard_locked", "is_force_reserved",
         "is_scheduled_future_stock_release",
         "move_ids.state", "move_ids.product_uom_qty",
@@ -90,7 +91,22 @@ class SaleOrderLine(models.Model):
                 or line.is_reservation_hard_locked
                 or line.is_force_reserved
             )
-            if overridden or not order.pick_scheduled_date:
+            # A no_invoice order (not hard-locked, not force-reserved) has
+            # no legitimate claim on stock at all — the module's whole
+            # premise. Without this check, a line that happened to
+            # qualify for "Scheduled Future Stock" while genuinely
+            # eligible (e.g. in grace_period) would keep that tag even
+            # after the order lost eligibility entirely (demoted via a
+            # full refund, expired out of grace_period, or manually
+            # overridden to no_invoice) — and since that tag PROTECTS a
+            # line from the blanket reclaim in _reserve_by_clearance, an
+            # order with zero real claim could indefinitely squat on
+            # stock it's not entitled to, just by coincidentally matching
+            # a future incoming shipment. Never true for a genuinely
+            # ineligible order, so this must be checked before anything
+            # else below, including the persistent release flag.
+            ineligible = order.fulfillment_stage == "no_invoice" and not overridden
+            if overridden or ineligible or not order.pick_scheduled_date:
                 line.clearance_defer_reason = False
                 continue
             if order.pick_scheduled_date > cutoff:

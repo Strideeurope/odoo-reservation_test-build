@@ -70,6 +70,13 @@ class TestClearanceReservation(TransactionCase):
         scheduled date could still trigger a release from a holder even
         after the tier fix above — closed by excluding force-reserved
         lines from that pass's demand pool entirely.
+      - found via live data: the "Scheduled Future Stock" tag itself was
+        computed with no check on whether the order was even eligible to
+        be in the queue at all — a no_invoice order (no payment, no
+        override, no lock) that happened to still hold stock and
+        coincidentally match a future incoming shipment kept the tag
+        (and the reclaim protection it grants) indefinitely, letting it
+        squat on stock it had zero legitimate claim to.
     """
 
     @classmethod
@@ -981,3 +988,46 @@ class TestClearanceReservation(TransactionCase):
             holder.order_line.clearance_defer_reason,
             "with nothing backing it any more, the line falls back to ordinary priority",
         )
+
+    def test_ineligible_order_never_shields_foreign_stock_via_scheduled_future_stock(self):
+        """Bug found via live data: an order that qualified for
+        "Scheduled Future Stock" while genuinely eligible (e.g.
+        grace_period) kept that tag — and the protection from reclaim it
+        grants — even after losing eligibility entirely (manual override
+        to no_invoice, a full refund, or grace-period expiry). Since the
+        tag shields a line from the blanket reclaim in
+        _reserve_by_clearance, a no_invoice order with zero real claim
+        could indefinitely squat on stock it's not entitled to, purely by
+        coincidentally matching a future incoming shipment — directly
+        contradicting the module's foundational rule that a no_invoice
+        order (not hard-locked, not force-reserved) has no legitimate
+        claim on stock at all.
+        """
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        scheduled = fields.Datetime.now() + relativedelta(days=30)
+        order.pick_scheduled_date = scheduled
+        order.order_line.invalidate_recordset()
+        self.assertEqual(order.order_line.move_ids.quantity, 10)
+
+        self._create_committed_po(10, scheduled - timedelta(days=14))
+        self.env.invalidate_all()
+        self.assertEqual(order.order_line.clearance_defer_reason, "Scheduled Future Stock")
+
+        # Loses eligibility entirely — manual override to no_invoice.
+        order.write({"fulfillment_stage": "no_invoice"})
+        self.env.invalidate_all()
+        self.assertFalse(
+            order.order_line.clearance_defer_reason,
+            "a no_invoice order must never keep this tag, regardless of any matching future PO",
+        )
+
+        # An ordinary competing order must be able to reclaim the stock —
+        # the now-ineligible order has no more protection than any other
+        # no_invoice/foreign holder.
+        competitor = self._make_order(self.partner_b, 10)
+        self.env["sale.order"]._reserve_by_clearance(product_ids=[self.product.id])
+        order.order_line.invalidate_recordset()
+        competitor.order_line.invalidate_recordset()
+        self.assertEqual(order.order_line.move_ids.quantity, 0, "the ineligible order must give up its stock")
+        self.assertEqual(competitor.order_line.move_ids.quantity, 10, "a genuinely eligible order reclaims it")
