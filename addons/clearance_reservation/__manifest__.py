@@ -4,9 +4,12 @@
     "depends": ["sale_management", "stock", "account", "purchase"],
     "data": [
         "security/security.xml",
+        "security/ir.model.access.csv",
         "data/ir_cron.xml",
         "views/sale_order_views.xml",
         "views/stock_picking_views.xml",
+        "views/product_views.xml",
+        "views/clearance_bin_stock_views.xml",
     ],
     "assets": {
         "web.assets_backend": [

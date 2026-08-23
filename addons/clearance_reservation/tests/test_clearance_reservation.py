@@ -1194,3 +1194,115 @@ class TestClearanceReservation(TransactionCase):
             move.state, "confirmed",
             "explicitly overridden — relocation goes through same as an ordinary reservation",
         )
+
+
+@tagged("post_install", "-at_install")
+class TestClearanceBinStock(TransactionCase):
+    """clearance.bin.stock is deliberately inert as far as reservation is
+    concerned — it exists purely so a person can record where a product's
+    overstock physically sits, decoupled entirely from stock.quant. These
+    tests cover only that model's own behavior; they never touch
+    _reserve_by_clearance, by design."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.product = cls.env["product.product"].create({
+            "name": "Test Bin Stock Widget",
+            "is_storable": True,
+        })
+        cls.warehouse = cls.env["stock.warehouse"].search([], limit=1)
+        cls.bin_a = cls.env["stock.location"].create({
+            "name": "Test Bin A",
+            "location_id": cls.warehouse.view_location_id.id,
+            "usage": "internal",
+        })
+
+    def test_add_quantity_creates_and_increments(self):
+        record = self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a)
+        self.assertEqual(record.quantity, 0)
+        record.add_quantity(20, note="fresh pallet")
+        self.assertEqual(record.quantity, 20)
+        record.add_quantity(5)
+        self.assertEqual(record.quantity, 25)
+
+    def test_get_or_create_reuses_existing_record(self):
+        first = self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a)
+        first.add_quantity(10)
+        second = self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a)
+        self.assertEqual(first.id, second.id)
+        self.assertEqual(second.quantity, 10)
+
+    def test_remove_quantity_decrements(self):
+        record = self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a)
+        record.add_quantity(20)
+        record.remove_quantity(8, note="carried to Main")
+        self.assertEqual(record.quantity, 12)
+
+    def test_remove_quantity_blocks_going_negative(self):
+        record = self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a)
+        record.add_quantity(5)
+        with self.assertRaises(UserError):
+            record.remove_quantity(10)
+        self.assertEqual(record.quantity, 5, "a blocked removal must not partially apply")
+
+    def test_add_and_remove_reject_non_positive_quantities(self):
+        record = self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a)
+        with self.assertRaises(UserError):
+            record.add_quantity(0)
+        with self.assertRaises(UserError):
+            record.remove_quantity(-1)
+
+    def test_changes_never_touch_real_stock_or_reservation(self):
+        """The whole point of this model: logging bin stock must never
+        create, modify, or otherwise interact with any stock.quant, and
+        must never trigger the reservation queue."""
+        before_quants = self.env["stock.quant"].search_count([
+            ("product_id", "=", self.product.id)
+        ])
+        record = self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a)
+        record.add_quantity(50)
+        record.remove_quantity(20)
+        after_quants = self.env["stock.quant"].search_count([
+            ("product_id", "=", self.product.id)
+        ])
+        self.assertEqual(before_quants, after_quants, "must never create or touch a real stock.quant")
+        self.assertEqual(self.product.qty_available, 0, "real on-hand must be completely unaffected")
+
+    def test_bin_stock_total_matches_when_logged_correctly(self):
+        bin_b = self.env["stock.location"].create({
+            "name": "Test Bin B",
+            "location_id": self.warehouse.view_location_id.id,
+            "usage": "internal",
+        })
+        self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a).add_quantity(10)
+        self.env["clearance.bin.stock"]._get_or_create(self.product, bin_b).add_quantity(15)
+        self.product.invalidate_recordset()
+        self.assertEqual(self.product.bin_stock_total, 25)
+        self.assertEqual(self.product.bin_stock_count, 2)
+
+    def test_bin_stock_discrepancy_flags_mismatch_against_real_stock(self):
+        pick_rule = self.env["stock.rule"].search(
+            [("picking_type_id", "=", self.warehouse.pick_type_id.id)], limit=1
+        )
+        pick_source_location = pick_rule.location_src_id or self.warehouse.lot_stock_id
+        quant = self.env["stock.quant"].create({
+            "product_id": self.product.id,
+            "location_id": pick_source_location.id,
+        })
+        quant.with_context(inventory_mode=True).write({"inventory_quantity": 30})
+        quant.action_apply_inventory()
+
+        self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a).add_quantity(30)
+        self.product.invalidate_recordset()
+        self.assertEqual(
+            self.product.bin_stock_discrepancy, 0,
+            "tracked total matches real on-hand — logged correctly",
+        )
+
+        self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a).add_quantity(5)
+        self.product.invalidate_recordset()
+        self.assertEqual(
+            self.product.bin_stock_discrepancy, 5,
+            "tracked total now exceeds real on-hand — should surface as a mismatch to investigate",
+        )

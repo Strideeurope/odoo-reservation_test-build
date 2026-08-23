@@ -1,0 +1,23 @@
+<odoo>
+    <record id="view_product_normal_form_bin_stock" model="ir.ui.view">
+        <field name="name">product.product.form.bin.stock</field>
+        <field name="model">product.product</field>
+        <field name="inherit_id" ref="product.product_normal_form_view"/>
+        <field name="arch" type="xml">
+            <div name="button_box" position="inside">
+                <button name="action_view_bin_stock" type="object" class="oe_stat_button" icon="fa-map-marker">
+                    <field name="bin_stock_count" widget="statinfo" string="Bin Stock"/>
+                </button>
+            </div>
+            <xpath expr="//div[hasclass('oe_title')]" position="after">
+                <div class="text-muted mb-2" invisible="not bin_stock_count">
+                    Tracked bin stock: <field name="bin_stock_total" nolabel="1" class="oe_inline"/> —
+                    <span invisible="bin_stock_discrepancy == 0" class="text-danger">
+                        does not match on-hand (<field name="bin_stock_discrepancy" nolabel="1" class="oe_inline"/> off) — check for an unlogged placement/removal or a real loss.
+                    </span>
+                    <span invisible="bin_stock_discrepancy != 0" class="text-success">matches on-hand</span>
+                </div>
+            </xpath>
+        </field>
+    </record>
+</odoo>

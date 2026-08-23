@@ -1,0 +1,3 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_clearance_bin_stock_stock_user,clearance.bin.stock.stock.user,model_clearance_bin_stock,stock.group_stock_user,1,1,1,1
+access_clearance_bin_stock_wizard_stock_user,clearance.bin.stock.wizard.stock.user,model_clearance_bin_stock_wizard,stock.group_stock_user,1,1,1,1

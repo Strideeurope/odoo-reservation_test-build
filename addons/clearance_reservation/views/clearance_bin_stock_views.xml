@@ -1,0 +1,86 @@
+<odoo>
+    <record id="view_clearance_bin_stock_list" model="ir.ui.view">
+        <field name="name">clearance.bin.stock.list</field>
+        <field name="model">clearance.bin.stock</field>
+        <field name="arch" type="xml">
+            <list>
+                <field name="product_id"/>
+                <field name="location_id"/>
+                <field name="quantity"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_clearance_bin_stock_form" model="ir.ui.view">
+        <field name="name">clearance.bin.stock.form</field>
+        <field name="model">clearance.bin.stock</field>
+        <field name="arch" type="xml">
+            <form>
+                <sheet>
+                    <group>
+                        <field name="product_id"/>
+                        <field name="location_id"/>
+                        <field name="quantity"/>
+                    </group>
+                </sheet>
+                <chatter/>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_clearance_bin_stock" model="ir.actions.act_window">
+        <field name="name">Bin Stock</field>
+        <field name="res_model">clearance.bin.stock</field>
+        <field name="view_mode">list,form</field>
+    </record>
+
+    <!-- Two entry points into the SAME wizard form, each defaulting the
+         mode so a picker doesn't need an extra click to pick the right
+         one — "Place" and "Remove" are deliberately separate menu items
+         rather than one generic "Log" action. -->
+    <record id="view_clearance_bin_stock_wizard_form" model="ir.ui.view">
+        <field name="name">clearance.bin.stock.wizard.form</field>
+        <field name="model">clearance.bin.stock.wizard</field>
+        <field name="arch" type="xml">
+            <form>
+                <field name="mode" invisible="1"/>
+                <group>
+                    <field name="product_id"/>
+                    <field name="location_id"/>
+                    <field name="quantity"/>
+                    <field name="note" placeholder="Optional note"/>
+                </group>
+                <footer>
+                    <button name="action_confirm" type="object" string="Confirm" class="btn-primary"/>
+                    <button special="cancel" string="Cancel" class="btn-secondary"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+    <record id="action_clearance_bin_stock_place" model="ir.actions.act_window">
+        <field name="name">Place Pallet</field>
+        <field name="res_model">clearance.bin.stock.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="view_id" ref="view_clearance_bin_stock_wizard_form"/>
+        <field name="target">new</field>
+        <field name="context">{'default_mode': 'add'}</field>
+    </record>
+
+    <record id="action_clearance_bin_stock_remove" model="ir.actions.act_window">
+        <field name="name">Remove Pallet</field>
+        <field name="res_model">clearance.bin.stock.wizard</field>
+        <field name="view_mode">form</field>
+        <field name="view_id" ref="view_clearance_bin_stock_wizard_form"/>
+        <field name="target">new</field>
+        <field name="context">{'default_mode': 'remove'}</field>
+    </record>
+
+    <menuitem id="menu_clearance_bin_stock_root" name="Bin Stock" parent="stock.menu_stock_root" sequence="60"/>
+    <menuitem id="menu_clearance_bin_stock" name="Bin Stock" parent="menu_clearance_bin_stock_root"
+              action="action_clearance_bin_stock" sequence="10"/>
+    <menuitem id="menu_clearance_bin_stock_place" name="Place Pallet" parent="menu_clearance_bin_stock_root"
+              action="action_clearance_bin_stock_place" sequence="20"/>
+    <menuitem id="menu_clearance_bin_stock_remove" name="Remove Pallet" parent="menu_clearance_bin_stock_root"
+              action="action_clearance_bin_stock_remove" sequence="30"/>
+</odoo>

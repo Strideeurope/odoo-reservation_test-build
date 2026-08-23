@@ -6,3 +6,4 @@ from . import account_move
 from . import stock_forecasted
 from . import product
 from . import stock_quant
+from . import clearance_bin_stock
