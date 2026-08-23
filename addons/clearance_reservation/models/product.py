@@ -31,6 +31,14 @@ class ProductProduct(models.Model):
     # there's a genuine physical loss to fix via a real inventory
     # adjustment on Main).
     bin_stock_total = fields.Float(compute="_compute_bin_stock_total")
+    # The actual figure bin_stock_total is compared against — surfaced as
+    # its own field (not just baked into bin_stock_discrepancy) so the
+    # comparison is never ambiguous on screen. Odoo's native "On Hand"
+    # field elsewhere on the product form shows a DIFFERENT, larger
+    # number (qty_available, which also includes stock already picked
+    # and sitting in Output) — comparing the tracked total against THAT
+    # instead of this one produces a meaningless gap.
+    bin_stock_reference_qty = fields.Float(compute="_compute_bin_stock_total")
     bin_stock_discrepancy = fields.Float(compute="_compute_bin_stock_total")
     bin_stock_count = fields.Integer(compute="_compute_bin_stock_total")
 
@@ -55,6 +63,7 @@ class ProductProduct(models.Model):
                 product.with_context(location=warehouse.lot_stock_id.id).qty_available
                 if warehouse else product.qty_available
             )
+            product.bin_stock_reference_qty = stock_qty
             product.bin_stock_discrepancy = product.bin_stock_total - stock_qty
 
     def action_view_bin_stock(self):

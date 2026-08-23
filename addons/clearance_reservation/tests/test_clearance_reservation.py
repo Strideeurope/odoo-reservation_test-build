@@ -1299,6 +1299,12 @@ class TestClearanceBinStock(TransactionCase):
             self.product.bin_stock_discrepancy, 0,
             "tracked total matches real on-hand — logged correctly",
         )
+        self.assertEqual(
+            self.product.bin_stock_reference_qty, 30,
+            "the actual figure being compared against must be visible on its own, "
+            "never left implicit — comparing against Odoo's native On Hand field "
+            "instead (which also includes Output) would be misleading",
+        )
 
         self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a).add_quantity(5)
         self.product.invalidate_recordset()
