@@ -357,24 +357,26 @@ class SaleOrder(models.Model):
         # this never fires twice or clobbers an order already paid before
         # confirmation.
         #
-        # Stamped from create_date, not "now" — if a quotation sat around
-        # for a while before being confirmed, its genuine place in line is
-        # when it was FIRST created, not whenever someone got around to
-        # clicking Confirm. If it goes on to actually get paid while still
-        # in grace_period, this timestamp is what "graduating" below
-        # deliberately leaves untouched.
+        # Stamped from the actual moment of confirmation, not create_date —
+        # explicit product decision, reversed from an earlier design: a
+        # quotation that sat around for a while before being confirmed
+        # gets its place in line from when it was ACTUALLY confirmed, not
+        # from when it was first drafted. If it goes on to actually get
+        # paid while still in grace_period, this timestamp is what
+        # "graduating" below deliberately leaves untouched.
         fresh = self.filtered(lambda o: o.fulfillment_stage == "no_invoice")
         for order in fresh:
+            now = fields.Datetime.now()
             order.with_context(clearance_internal_write=True).write({
                 "fulfillment_stage": "grace_period",
-                "clearance_date": order.create_date,
+                "clearance_date": now,
                 "clearance_is_override": False,
             })
             order.message_post(body=(
                 f"Order confirmed — entered the Grace Period queue with clearance "
-                f"timestamp {order.create_date} (its original creation date, not "
-                f"now). Competes for stock for {GRACE_PERIOD_DAYS} days; demoted "
-                f"back to No Invoice if it isn't genuinely paid by then."
+                f"timestamp {now} (the moment of confirmation). Competes for "
+                f"stock for {GRACE_PERIOD_DAYS} days; demoted back to No Invoice "
+                f"if it isn't genuinely paid by then."
             ))
         return res
 

@@ -79,7 +79,7 @@ This is shown as a badge on the sale order form, on the Pick/Ship transfer heade
 
 ### 2.2 Grace period
 
-Confirming an order (`action_confirm`) doesn't require payment to join the queue — it gets a `clearance_date` immediately and competes like a paid order, but only for `GRACE_PERIOD_DAYS` (15). The timestamp used is the order's **`create_date`**, not the moment of confirmation — a quotation that sat around for a week before being confirmed keeps its original place in line.
+Confirming an order (`action_confirm`) doesn't require payment to join the queue — it gets a `clearance_date` immediately and competes like a paid order, but only for `GRACE_PERIOD_DAYS` (15). The timestamp used is the **actual moment of confirmation** — a quotation that sat around for a week before being confirmed gets its place in line from when it was actually confirmed, not from when it was first drafted.
 
 If no genuine payment arrives within the window, the daily cron (`_cron_expire_grace_period`) demotes the order back to No Invoice, clears its `clearance_date` with **no backup kept** — losing the grace period is a fresh start, not something to resume from later.
 

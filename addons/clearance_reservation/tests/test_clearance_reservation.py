@@ -657,22 +657,45 @@ class TestClearanceReservation(TransactionCase):
         self._pay_order(order)
         self.assertEqual(order.fulfillment_stage, "ship")
 
-    def test_grace_period_clearance_is_create_date_and_survives_graduation(self):
+    def test_grace_period_clearance_is_confirmation_time_and_survives_graduation(self):
         """Explicit product decision: a grace-period order's clearance
-        timestamp is its actual create_date, not the moment action_confirm
-        happened to run (a quotation can sit around before being
-        confirmed) — and graduating to order_pick via genuine payment
-        while still in grace_period must leave that exact timestamp
-        untouched, not restart the clock."""
+        timestamp is the actual moment action_confirm() runs, not the
+        order's create_date — a quotation that sat around for a while
+        before being confirmed gets its place in line from when it was
+        ACTUALLY confirmed, not from when it was first drafted. Graduating
+        to order_pick via genuine payment while still in grace_period must
+        leave that exact timestamp untouched, not restart the clock."""
         self._set_stock(10)
-        order = self._make_order(self.partner_a, 10)
+        order = self.env["sale.order"].create({
+            "partner_id": self.partner_a.id,
+            "order_line": [(0, 0, {"product_id": self.product.id, "product_uom_qty": 10})],
+        })
+        # Simulate a quotation that sat around for a while before being
+        # confirmed — create_date isn't writable via the ORM, so backdate
+        # it directly.
+        backdated_create = fields.Datetime.now() - timedelta(days=10)
+        self.env.cr.execute(
+            "UPDATE sale_order SET create_date = %s WHERE id = %s",
+            (backdated_create, order.id),
+        )
+        order.invalidate_recordset(["create_date"])
+        self.assertEqual(order.create_date, backdated_create)
+
+        order.action_confirm()
         self.assertEqual(order.fulfillment_stage, "grace_period")
-        self.assertEqual(order.clearance_date, order.create_date)
+        self.assertNotEqual(
+            order.clearance_date, backdated_create,
+            "must stamp the actual confirmation moment, not the (possibly stale) create_date",
+        )
+        confirmation_clearance = order.clearance_date
+        self.assertAlmostEqual(
+            confirmation_clearance, fields.Datetime.now(), delta=timedelta(seconds=5),
+        )
 
         self._pay_order(order)
         self.assertEqual(
-            order.clearance_date, order.create_date,
-            "graduating out of grace_period via real payment must not touch the original timestamp",
+            order.clearance_date, confirmation_clearance,
+            "graduating out of grace_period via real payment must not touch the confirmation timestamp",
         )
 
     def test_grace_period_expiry_starts_fresh_on_later_payment(self):
