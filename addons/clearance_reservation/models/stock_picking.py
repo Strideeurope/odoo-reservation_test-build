@@ -15,6 +15,12 @@ class StockPicking(models.Model):
     # in the move list (stock.move.clearance_lock_reason directly) carries
     # the full detail.
     clearance_lock_reason = fields.Char(compute="_compute_clearance_lock_reason")
+    # True only for a transfer sale_order.py generated on its own to
+    # instantly top up Picking Zone from Buffer Zone (see
+    # _ensure_buffer_replenishment) — never set on a picking a person
+    # created themselves. Purely for traceability/filtering; nothing in
+    # this module branches on it.
+    is_clearance_replenishment = fields.Boolean(copy=False)
 
     def _compute_clearance_lock_reason(self):
         for picking in self:
