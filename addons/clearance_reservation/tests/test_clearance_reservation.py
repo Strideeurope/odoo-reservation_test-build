@@ -76,6 +76,15 @@ class TestClearanceReservation(TransactionCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.warehouse = cls.env["stock.warehouse"].search([], limit=1)
+        # Resolved dynamically, not hard-coded to lot_stock_id — the
+        # warehouse's actual Pick source location is whatever its
+        # "Stock -> Customers" rule currently points at (may be scoped to
+        # a specific sub-location, e.g. a dedicated picking zone, rather
+        # than the flat top-level Stock location).
+        pick_rule = cls.env["stock.rule"].search(
+            [("picking_type_id", "=", cls.warehouse.pick_type_id.id)], limit=1
+        )
+        cls.pick_source_location = pick_rule.location_src_id or cls.warehouse.lot_stock_id
         cls.product = cls.env["product.product"].create({
             "name": "Test Clearance Widget",
             "is_storable": True,
@@ -88,12 +97,12 @@ class TestClearanceReservation(TransactionCase):
         product = product or self.product
         quant = self.env["stock.quant"].search([
             ("product_id", "=", product.id),
-            ("location_id", "=", self.warehouse.lot_stock_id.id),
+            ("location_id", "=", self.pick_source_location.id),
         ])
         if not quant:
             quant = self.env["stock.quant"].create({
                 "product_id": product.id,
-                "location_id": self.warehouse.lot_stock_id.id,
+                "location_id": self.pick_source_location.id,
             })
         quant.with_context(inventory_mode=True).write({"inventory_quantity": qty})
         quant.action_apply_inventory()

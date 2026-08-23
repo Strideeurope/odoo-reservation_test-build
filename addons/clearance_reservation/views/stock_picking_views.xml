@@ -44,6 +44,18 @@
             <xpath expr="(//field[@name='date_deadline'])[1]" position="attributes">
                 <attribute name="invisible">1</attribute>
             </xpath>
+            <!-- The Pick operation only ever reserves from (and shows) the
+                 Picking Zone — a line can legitimately show 0 there while
+                 the product genuinely exists elsewhere in the warehouse
+                 (Buffer Zone), since Buffer stock is deliberately never
+                 claimed by this move. Left unexplained, that reads as
+                 "nothing to be had" rather than "go get it from Buffer
+                 first" — this column surfaces the true total without the
+                 slip ever exposing Buffer as a distinct source location. -->
+            <xpath expr="//field[@name='move_ids_without_package']//field[@name='product_uom_qty']"
+                   position="after">
+                <field name="total_warehouse_qty_available" string="Total in Warehouse" optional="show"/>
+            </xpath>
         </field>
     </record>
 </odoo>

@@ -114,7 +114,26 @@ class StockForecasted(models.AbstractModel):
             loc_id = location[0] if isinstance(location, (list, tuple)) else location
             return loc_id == output_location_id
 
-        lines = [line for line in lines if not _is_from_output(line)]
+        # A "Free Stock in Transit" line with a zero-or-negative quantity
+        # and no actual outgoing demand attached is a reconciliation
+        # artifact of the native report's own math, not real information —
+        # it shows up specifically because we scope the Pick route's
+        # source to a sub-location (Picking Zone) rather than the
+        # warehouse's own top-level Stock location. The native report
+        # remaps every sub-location's on-hand quantity up to the
+        # top-level Stock key when tallying "free stock" (so the real
+        # total is still counted correctly there), but it decrements
+        # reserved/consumed quantity keyed by the MOVE's own location
+        # (Picking Zone) instead — a key that was never populated after
+        # the remap, so the decrement silently goes negative there,
+        # producing a phantom line that exactly cancels out an amount
+        # already correctly reflected in the real "free stock" line.
+        # Never true "stock genuinely in motion between locations" (that
+        # would show as a positive quantity here instead).
+        def _is_phantom_transit(line):
+            return line.get("in_transit") and not line.get("move_out") and line.get("quantity", 0) <= 0
+
+        lines = [line for line in lines if not _is_from_output(line) and not _is_phantom_transit(line)]
 
         order_ids = {
             line["document_out"]["id"]

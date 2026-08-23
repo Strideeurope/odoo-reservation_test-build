@@ -11,6 +11,30 @@ class StockMove(models.Model):
     # reservation locked", so both surfaces can never drift out of sync
     # with each other.
     clearance_lock_reason = fields.Char(compute="_compute_clearance_lock_reason")
+    # The Pick operation only ever reserves from (and shows) the Picking
+    # Zone — a picker's slip legitimately shows 0 there even when the
+    # product genuinely exists elsewhere in the warehouse (Buffer Zone),
+    # since that stock hasn't been claimed by this move yet. Left as a
+    # silent 0 with no explanation, that reads as "there's nothing to be
+    # had" rather than "go find it in Buffer and bring it here first" —
+    # this surfaces the true total so the picker knows there's something
+    # to go get, without the slip itself ever exposing Buffer as a
+    # distinct source location. Not stored: a live figure, recomputed on
+    # every view render, same as any other on-hand quantity display.
+    total_warehouse_qty_available = fields.Float(
+        string="Total in Warehouse",
+        compute="_compute_total_warehouse_qty_available",
+    )
+
+    def _compute_total_warehouse_qty_available(self):
+        for move in self:
+            warehouse = move.picking_id.picking_type_id.warehouse_id or move.picking_type_id.warehouse_id
+            if not move.product_id or not warehouse:
+                move.total_warehouse_qty_available = 0.0
+                continue
+            move.total_warehouse_qty_available = move.product_id.with_context(
+                location=warehouse.lot_stock_id.id
+            ).qty_available
 
     def _compute_clearance_lock_reason(self):
         for move in self:
