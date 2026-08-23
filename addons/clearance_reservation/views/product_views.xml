@@ -9,6 +9,18 @@
                     <field name="bin_stock_total" widget="statinfo" string="Bin Stock"/>
                 </button>
             </div>
+            <!-- Native "On Hand" button shows qty_available, which also
+                 counts stock already picked and sitting in WH/Output
+                 awaiting shipment — not a "where do I find it on a bin"
+                 figure. Only the DISPLAYED value is swapped to
+                 bin_stock_reference_qty (same Stock-only scoping as the
+                 Bin Stock button above); qty_available itself is left
+                 completely untouched since it's relied on elsewhere
+                 (pricing, reordering, other modules). -->
+            <xpath expr="//button[@name='action_update_quantity_on_hand']//field[@name='qty_available']"
+                   position="replace">
+                <field name="bin_stock_reference_qty" nolabel="1" class="oe_inline"/>
+            </xpath>
         </field>
     </record>
 </odoo>
