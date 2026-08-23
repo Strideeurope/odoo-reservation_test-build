@@ -16,25 +16,12 @@ class StockQuant(models.Model):
         # scratch against current on-hand, so a downward count naturally
         # reallocates the now-scarcer stock to whoever has priority.
         #
-        # skip_buffer_replenishment: a manual count is a ground-truth
-        # correction, not new demand — it must never be silently "fixed"
-        # by auto-pulling more stock in from Buffer. Without this, someone
-        # correcting an over-count at Picking Zone down to the true figure
-        # would immediately see it pulled right back up again, since the
-        # very same order demand that originally triggered a top-up is
-        # still sitting there unchanged. Real new demand still gets its
-        # top-up from every OTHER trigger (order confirmation, a lock
-        # toggle, an incoming receipt, the nightly cron) — this only ever
-        # suppresses it for a plain recount.
-        #
         # Scoped to just the product(s) actually counted here — never a
         # full, unscoped run — since stock is reserved per product and an
         # adjustment to one product has no bearing on any other.
         product_ids = self.product_id.ids
         if product_ids:
-            self.env["sale.order"].with_context(
-                skip_buffer_replenishment=True
-            )._reserve_by_clearance(product_ids=product_ids)
+            self.env["sale.order"]._reserve_by_clearance(product_ids=product_ids)
         return res
 
     def _clearance_locked_moves(self):
@@ -98,13 +85,8 @@ class StockQuant(models.Model):
         # the re-run below a warehouse staffer relocating reserved stock
         # would leave that order silently unreserved until some unrelated
         # event happened to touch the same product. Re-running the queue
-        # here means the order automatically reclaims its reservation at
-        # the new location on this same pass — no manual cleanup, no
-        # silent gap. Also what backs sale_order.py's own instant
-        # Buffer-to-Picking top-up, which calls this same method
-        # internally; the existing _within_reserve_by_clearance recursion
-        # guard on that method prevents this from double-firing in that
-        # case.
+        # here means the order automatically reclaims whatever's still on
+        # hand for it on this same pass — no manual cleanup, no silent gap.
         product_ids = self.product_id.ids
         res = super().move_quants(
             location_dest_id=location_dest_id, package_dest_id=package_dest_id,

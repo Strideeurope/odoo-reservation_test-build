@@ -15,12 +15,6 @@ class StockPicking(models.Model):
     # in the move list (stock.move.clearance_lock_reason directly) carries
     # the full detail.
     clearance_lock_reason = fields.Char(compute="_compute_clearance_lock_reason")
-    # True only for a transfer sale_order.py generated on its own to
-    # instantly top up Picking Zone from Buffer Zone (see
-    # _ensure_buffer_replenishment) — never set on a picking a person
-    # created themselves. Purely for traceability/filtering; nothing in
-    # this module branches on it.
-    is_clearance_replenishment = fields.Boolean(copy=False)
 
     def _compute_clearance_lock_reason(self):
         for picking in self:
@@ -79,15 +73,20 @@ class StockPicking(models.Model):
 
         # New stock arriving is the other natural "maybe a pending order can
         # now be satisfied" moment, alongside a manual inventory adjustment.
+        # Covers both a genuine receipt AND a completed internal transfer —
+        # the latter is how Picking Zone actually gets restocked from
+        # Buffer Zone now (a native Reordering Rule generates the transfer,
+        # a person physically completes it), and nothing else would ever
+        # tell a waiting order to retry once that real restock lands.
         # Gated on state == 'done': button_validate can instead return a
         # wizard action (immediate-transfer / backorder confirmation), in
         # which case nothing has actually been received yet and reservation
         # would just be working off stale quantities.
-        incoming_done = self.filtered(
-            lambda p: p.picking_type_id.code == "incoming" and p.state == "done"
+        restocking_done = self.filtered(
+            lambda p: p.picking_type_id.code in ("incoming", "internal") and p.state == "done"
         )
-        if incoming_done:
-            product_ids = incoming_done.move_ids.product_id.ids
+        if restocking_done:
+            product_ids = restocking_done.move_ids.product_id.ids
             if product_ids:
                 self.env["sale.order"]._reserve_by_clearance(product_ids=product_ids)
 

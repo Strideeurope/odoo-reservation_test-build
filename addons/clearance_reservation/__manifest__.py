@@ -7,7 +7,6 @@
         "data/ir_cron.xml",
         "views/sale_order_views.xml",
         "views/stock_picking_views.xml",
-        "views/stock_warehouse_views.xml",
     ],
     "assets": {
         "web.assets_backend": [

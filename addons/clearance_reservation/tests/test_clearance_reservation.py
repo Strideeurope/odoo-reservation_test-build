@@ -77,16 +77,22 @@ class TestClearanceReservation(TransactionCase):
         coincidentally match a future incoming shipment kept the tag
         (and the reclaim protection it grants) indefinitely, letting it
         squat on stock it had zero legitimate claim to.
-    - explicit product decision: reservation must succeed as long as
-      stock exists anywhere in the warehouse (Picking Zone or Buffer
-      Zone), not just Picking Zone alone — via an instant, already-
-      validated internal transfer (never a pending one left for a human
-      to validate first). The Pick move itself always stays sourced from
-      Picking Zone only. Separately, Odoo's native "Relocate" quant
-      action can move already-reserved stock with no error, but silently
-      drops the reservation as a side effect — the module re-runs the
-      queue right after any such relocation so the affected order
-      automatically reclaims its spot.
+    - the Pick move only ever sources from (and reserves out of) Picking
+      Zone — Buffer Zone is never touched by this queue at all.
+      Restocking Picking Zone from Buffer is handled entirely outside
+      this module, by a native Odoo Reordering Rule + resupply route, so
+      a real person always has to physically complete that transfer
+      before the stock counts as available here — explicit product
+      decision, after an earlier version of this feature that instantly
+      "moved" stock in the database with nobody having physically moved
+      anything, which broke trust in the warehouse's location data.
+    - Odoo's native "Relocate" quant action can move already-reserved
+      stock with no error, but silently drops the reservation as a side
+      effect, and bypasses hard-lock/force-reserve protection entirely
+      (unlike _do_unreserve/_action_cancel, which both correctly refuse).
+      Fixed to mirror that same two-tier refusal, and to re-run the queue
+      right after any allowed relocation so the affected order
+      automatically reclaims whatever's still on hand for it.
     """
 
     @classmethod
@@ -102,17 +108,6 @@ class TestClearanceReservation(TransactionCase):
             [("picking_type_id", "=", cls.warehouse.pick_type_id.id)], limit=1
         )
         cls.pick_source_location = pick_rule.location_src_id or cls.warehouse.lot_stock_id
-        # A fresh location, wired to the warehouse's own
-        # buffer_zone_location_id field — deliberately not assuming any
-        # pre-existing Buffer Zone location, so these tests are
-        # self-contained regardless of what a real deployment has
-        # configured.
-        cls.buffer_location = cls.env["stock.location"].create({
-            "name": "Test Buffer Zone",
-            "location_id": cls.warehouse.view_location_id.id,
-            "usage": "internal",
-        })
-        cls.warehouse.buffer_zone_location_id = cls.buffer_location.id
         cls.product = cls.env["product.product"].create({
             "name": "Test Clearance Widget",
             "is_storable": True,
@@ -131,20 +126,6 @@ class TestClearanceReservation(TransactionCase):
             quant = self.env["stock.quant"].create({
                 "product_id": product.id,
                 "location_id": self.pick_source_location.id,
-            })
-        quant.with_context(inventory_mode=True).write({"inventory_quantity": qty})
-        quant.action_apply_inventory()
-
-    def _set_buffer_stock(self, qty, product=None):
-        product = product or self.product
-        quant = self.env["stock.quant"].search([
-            ("product_id", "=", product.id),
-            ("location_id", "=", self.buffer_location.id),
-        ])
-        if not quant:
-            quant = self.env["stock.quant"].create({
-                "product_id": product.id,
-                "location_id": self.buffer_location.id,
             })
         quant.with_context(inventory_mode=True).write({"inventory_quantity": qty})
         quant.action_apply_inventory()
@@ -1154,266 +1135,6 @@ class TestClearanceReservation(TransactionCase):
             waiting_line.get("lock_reason"), "Scheduled Future Stock",
             "the still-waiting remainder must show the badge",
         )
-
-    def test_buffer_replenishment_reserves_order_when_picking_empty(self):
-        """Explicit product decision: reservation must succeed as long as
-        stock exists ANYWHERE in the warehouse, not just Picking Zone —
-        via an instant, already-validated internal transfer, never a
-        pending one left for a human to validate first. The Pick move
-        itself must still only ever source from Picking Zone."""
-        self._set_buffer_stock(10)
-        order = self._make_order(self.partner_a, 10)
-        move = order.order_line.move_ids
-        self.assertEqual(
-            move.state, "assigned",
-            "should be fully reserved via instant buffer top-up",
-        )
-        self.assertEqual(
-            move.location_id, self.pick_source_location,
-            "the Pick move itself must still only ever source from Picking Zone",
-        )
-        # Scoped to this test's own product — the suite runs against a
-        # shared dev database that can carry replenishment pickings from
-        # unrelated products (e.g. earlier live verification), which an
-        # unscoped search would wrongly pick up too.
-        replenishment = self.env["stock.picking"].search([
-            ("is_clearance_replenishment", "=", True),
-            ("move_ids.product_id", "=", self.product.id),
-        ])
-        self.assertEqual(len(replenishment), 1, "expected exactly one auto-generated replenishment transfer")
-        self.assertEqual(
-            replenishment.state, "done",
-            "must be immediately validated, not left pending for a human",
-        )
-
-    def test_buffer_replenishment_lands_at_products_existing_picking_sub_location(self):
-        """Found via live data: replenishment must never dump stock into
-        the flat parent Picking Zone location when the product already
-        has its own dedicated picking sub-location — that scatters it
-        away from where a picker actually looks for this product ("one
-        dedicated picking location per product"). The spot being
-        currently empty (a zero-quantity quant) must still count as
-        "this is the spot" — that's exactly the shortfall being
-        replenished for."""
-        product_spot = self.env["stock.location"].create({
-            "name": "Test Product A Spot",
-            "location_id": self.pick_source_location.id,
-            "usage": "internal",
-        })
-        self.env["stock.quant"].create({
-            "product_id": self.product.id,
-            "location_id": product_spot.id,
-        })
-        self._set_buffer_stock(10)
-        order = self._make_order(self.partner_a, 10)
-        move = order.order_line.move_ids
-        self.assertEqual(move.state, "assigned")
-
-        replenishment_moves = self.env["stock.move"].search([
-            ("location_id", "=", self.buffer_location.id),
-            ("product_id", "=", self.product.id),
-            ("state", "=", "done"),
-        ])
-        self.assertTrue(replenishment_moves)
-        self.assertEqual(
-            replenishment_moves.location_dest_id, product_spot,
-            "must land at the product's own dedicated picking spot, never the flat parent zone",
-        )
-
-    def test_manual_inventory_count_never_triggers_buffer_replenishment(self):
-        """Found via a live bug: a plain inventory count at either location
-        must never react to a pre-existing order shortfall by auto-pulling
-        stock in from Buffer — a count is a ground-truth correction, not
-        new demand. Two counts in particular created a doom loop live:
-        counting Buffer (routine) and correcting an over-count at Picking
-        Zone both silently triggered more stock to move, climbing higher
-        with every attempt at fixing it."""
-        # Order genuinely short at Picking Zone — no buffer configured
-        # with stock yet, so it stays unreserved (a real, pre-existing
-        # shortfall, not a fabricated one).
-        order = self._make_order(self.partner_a, 10)
-        move = order.order_line.move_ids
-        self.assertNotEqual(move.state, "assigned")
-
-        # Buffer now has plenty — but every trigger below is a plain
-        # inventory count, never a genuine new-demand event. Neither may
-        # react to the order's still-outstanding shortfall.
-        self._set_buffer_stock(50)
-        self._set_stock(0)
-
-        move.invalidate_recordset()
-        self.assertNotEqual(
-            move.state, "assigned",
-            "a manual inventory count must never trigger a buffer top-up",
-        )
-        replenishment = self.env["stock.picking"].search([
-            ("is_clearance_replenishment", "=", True),
-            ("move_ids.product_id", "=", self.product.id),
-        ])
-        self.assertFalse(replenishment, "no replenishment should ever be triggered by a manual count")
-
-    def test_buffer_replenishment_moves_exact_shortfall_only(self):
-        """Only the actual shortfall moves — Picking already has some
-        stock, Buffer has plenty more; must top up only what's needed."""
-        self._set_stock(4)
-        self._set_buffer_stock(50)
-        order = self._make_order(self.partner_a, 10)
-        move = order.order_line.move_ids
-        self.assertEqual(move.state, "assigned")
-        replenishment_moves = self.env["stock.move"].search([
-            ("location_id", "=", self.buffer_location.id),
-            ("location_dest_id", "=", self.pick_source_location.id),
-        ])
-        self.assertEqual(
-            sum(replenishment_moves.mapped("product_uom_qty")), 6,
-            "only the 6-unit shortfall (10 needed - 4 already at Picking) should move",
-        )
-
-    def test_buffer_replenishment_insufficient_combined_stock_leaves_genuine_shortfall(self):
-        """Picking + Buffer combined still can't cover demand — no
-        over-creation, and the line is correctly left genuinely short,
-        exactly as it would be without this feature at all."""
-        self._set_stock(2)
-        self._set_buffer_stock(3)
-        order = self._make_order(self.partner_a, 10)
-        move = order.order_line.move_ids
-        self.assertEqual(move.state, "partially_available")
-        self.assertEqual(move.quantity, 5, "reserved everything available (2 + 3), still short of 10")
-        replenishment = self.env["stock.picking"].search([
-            ("is_clearance_replenishment", "=", True),
-            ("move_ids.product_id", "=", self.product.id),
-        ])
-        self.assertEqual(len(replenishment), 1, "one replenishment attempt, no runaway duplicate creation")
-
-    def test_relocating_reserved_quant_reclaims_reservation_via_auto_replenishment(self):
-        """Odoo's native "Relocate" quant action (stock.quant.move_quants,
-        the method behind the Inventory > Reporting > Locations wizard)
-        can move already-reserved stock with no error — but as a side
-        effect it silently drops the existing reservation. Relocating
-        reserved Picking Zone stock into Buffer Zone must not leave the
-        order stranded: the module's own move_quants override re-runs the
-        queue immediately, which — via the same instant top-up as any
-        other shortfall — pulls the stock straight back into Picking Zone
-        and re-reserves it, all within this one call."""
-        self._set_stock(10)
-        order = self._make_order(self.partner_a, 10)
-        move = order.order_line.move_ids
-        self.assertEqual(move.state, "assigned")
-
-        quant = self.env["stock.quant"]._gather(self.product, self.pick_source_location)
-        quant.move_quants(location_dest_id=self.buffer_location)
-
-        move.invalidate_recordset()
-        self.assertEqual(
-            move.state, "assigned",
-            "relocation drops the old reservation, but the auto-replenishment "
-            "triggered by move_quants' own override should have already pulled "
-            "the stock back into Picking Zone and re-reserved it",
-        )
-        self.assertEqual(move.location_id, self.pick_source_location)
-
-    def test_buffer_replenishment_combines_multiple_products_into_one_transfer(self):
-        """Two different products both needing a top-up in the SAME pass
-        of _reserve_by_clearance must land on ONE combined transfer, not
-        a separate one per product — a single document for a warehouse
-        staffer to act on. Stock is set via the low-level quant API
-        directly (bypassing _apply_inventory's own per-call reservation
-        trigger) specifically so both shortfalls are only ever addressed
-        by the single explicit _reserve_by_clearance() call below, not by
-        two separate triggered passes."""
-        other_product = self.env["product.product"].create({
-            "name": "Test Clearance Widget B",
-            "is_storable": True,
-        })
-        order_a = self._make_order(self.partner_a, 10)
-        order_b = self._make_order(self.partner_b, 5, product=other_product)
-        self.assertNotEqual(order_a.order_line.move_ids.state, "assigned", "no stock yet")
-        self.assertNotEqual(order_b.order_line.move_ids.state, "assigned", "no stock yet")
-
-        self.env["stock.quant"]._update_available_quantity(self.product, self.buffer_location, 10)
-        self.env["stock.quant"]._update_available_quantity(other_product, self.buffer_location, 5)
-        self.env["sale.order"]._reserve_by_clearance()
-
-        replenishments = self.env["stock.picking"].search([
-            ("is_clearance_replenishment", "=", True),
-            ("move_ids.product_id", "in", [self.product.id, other_product.id]),
-        ])
-        self.assertEqual(
-            len(replenishments), 1,
-            "both products' shortfalls should combine into a single transfer",
-        )
-        self.assertEqual(len(replenishments.move_ids), 2, "one move per product on that transfer")
-
-    def test_buffer_replenishment_preserves_priority_between_competing_orders(self):
-        """Buffer only covers ONE of two competing orders' demand — the
-        top-up must not disturb the existing priority ordering: whichever
-        order actually has priority gets fully reserved, the other stays
-        short, exactly as it would with an ordinary (non-buffer) shortage."""
-        self._set_buffer_stock(10)
-        earlier = self._make_order(self.partner_a, 10)
-        later = self._make_order(self.partner_b, 10)
-        earlier.order_line.move_ids.invalidate_recordset()
-        later.order_line.move_ids.invalidate_recordset()
-        self.assertEqual(
-            earlier.order_line.move_ids.state, "assigned",
-            "earlier-cleared order should win the only 10 units the buffer had",
-        )
-        self.assertEqual(
-            later.order_line.move_ids.state, "confirmed",
-            "later order should still be genuinely short — the top-up must not "
-            "manufacture stock beyond what buffer actually had",
-        )
-
-    def test_buffer_replenishment_skipped_for_far_future_order(self):
-        """An order scheduled more than FAR_FUTURE_MONTHS out has no
-        business holding scarce stock today (existing rule) — it must
-        also never trigger a buffer replenishment on Buffer's behalf,
-        which would otherwise move real stock for no legitimate demand.
-        Scheduled far-future BEFORE any stock exists anywhere, so the
-        order never gets a chance to legitimately reserve (and trigger a
-        top-up) before becoming far-future — otherwise this would just be
-        testing that an already-topped-up order keeps what it has, not
-        that a far-future one is denied a NEW top-up."""
-        order = self._make_order(self.partner_a, 10)
-        order.pick_scheduled_date = fields.Datetime.now() + relativedelta(months=7)
-        self._set_buffer_stock(10)
-
-        replenishments = self.env["stock.picking"].search([
-            ("is_clearance_replenishment", "=", True),
-            ("move_ids.product_id", "=", self.product.id),
-        ])
-        self.assertFalse(
-            replenishments,
-            "a far-future, non-overridden order must never trigger a buffer top-up",
-        )
-
-    def test_buffer_replenishment_skipped_when_buffer_zone_not_configured(self):
-        """Left unconfigured, the feature must no-op completely — a
-        shortfall waits exactly as it did before this existed."""
-        self.warehouse.buffer_zone_location_id = False
-        self._set_buffer_stock(10)
-        order = self._make_order(self.partner_a, 10)
-        move = order.order_line.move_ids
-        self.assertNotEqual(move.state, "assigned", "must not reserve from an unconfigured buffer")
-        replenishments = self.env["stock.picking"].search([
-            ("is_clearance_replenishment", "=", True),
-            ("move_ids.product_id", "=", self.product.id),
-        ])
-        self.assertFalse(replenishments)
-
-    def test_buffer_replenishment_covers_a_force_reserved_line(self):
-        """The top-up isn't limited to ordinary clearance-tier demand —
-        a force-reserved line short on Picking Zone stock, with enough in
-        Buffer, must be topped up and reserved too."""
-        self._set_buffer_stock(10)
-        order = self._make_admin_only_order(self.partner_a, 10)
-        order.order_line.is_force_reserved = True
-        order.order_line.move_ids.invalidate_recordset()
-        self.assertEqual(order.order_line.move_ids.state, "assigned")
-        replenishments = self.env["stock.picking"].search(
-            [("is_clearance_replenishment", "=", True)]
-        )
-        self.assertTrue(replenishments)
 
     def test_relocate_blocked_for_hard_locked_reservation(self):
         """Relocating a hard-locked reservation must be refused outright,
