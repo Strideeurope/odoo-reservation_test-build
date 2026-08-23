@@ -25,21 +25,6 @@ services:
       - ./config/odoo.conf:/etc/odoo/odoo.conf
     restart: unless-stopped
 
-  caddy:
-    image: caddy:2
-    depends_on:
-      - odoo
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile
-      - caddy-data:/data
-      - caddy-config:/config
-    restart: unless-stopped
-
 volumes:
   odoo-db-data:
   odoo-web-data:
-  caddy-data:
-  caddy-config:
