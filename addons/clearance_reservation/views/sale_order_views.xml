@@ -34,7 +34,7 @@
                      correctly locking an already-assigned move too) as
                      action_force_reserve() itself did, making the
                      separate action buttons redundant. -->
-                <field name="is_force_reserved" widget="boolean_toggle" optional="show" string="Force Reserved"
+                <field name="is_force_reserved" widget="boolean_toggle" optional="show" string="Hold"
                        readonly="pick_fully_validated"/>
                 <field name="is_reservation_hard_locked" widget="boolean_toggle" optional="show"
                        string="Hard Lock" readonly="pick_fully_validated"/>

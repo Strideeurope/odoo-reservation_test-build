@@ -66,7 +66,7 @@ class SaleOrder(models.Model):
     # regardless of how it got set before.
     clearance_is_override = fields.Boolean(copy=False)
     is_reservation_hard_locked = fields.Boolean(
-        string="Reservation Hard Lock",
+        string="Lock Reservations",
         copy=False,
         help="Once stock is reserved for this order, it can never be unreserved "
              "by any process, including manual overrides.",
