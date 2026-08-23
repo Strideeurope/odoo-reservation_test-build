@@ -55,7 +55,22 @@ class StockMove(models.Model):
                 # exact cutoff logic) identical everywhere it's shown:
                 # here (picking header badge, forecast), and on the order
                 # line itself.
-                move.clearance_lock_reason = sale_line.clearance_defer_reason or False
+                defer_reason = sale_line.clearance_defer_reason
+                # "Scheduled Future Stock" marks a line as ELIGIBLE to
+                # give up its stock later (or still waiting to reclaim
+                # what it already gave up) — that's meaningful internal
+                # protection (see sale_order.py's move_priority/protected
+                # set) regardless of current state, but as a user-facing
+                # badge it should only appear while genuinely short right
+                # now. A move sitting at "assigned" already holds its
+                # full demand — nothing pending, nothing to flag — even
+                # though the line underneath may still legitimately carry
+                # the tag (and its protection) in case an earlier-
+                # scheduled competitor needs it later.
+                if defer_reason == "Scheduled Future Stock" and move.state == "assigned":
+                    move.clearance_lock_reason = False
+                else:
+                    move.clearance_lock_reason = defer_reason or False
 
     def _do_unreserve(self):
         hard_locked = self.filtered(

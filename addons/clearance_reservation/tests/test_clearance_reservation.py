@@ -1031,3 +1031,47 @@ class TestClearanceReservation(TransactionCase):
         competitor.order_line.invalidate_recordset()
         self.assertEqual(order.order_line.move_ids.quantity, 0, "the ineligible order must give up its stock")
         self.assertEqual(competitor.order_line.move_ids.quantity, 10, "a genuinely eligible order reclaims it")
+
+    def test_scheduled_future_stock_badge_hidden_when_fully_held(self):
+        """Found via a live-data question: a line fully holding its
+        demand still showed the "Scheduled Future Stock" badge just
+        because it was eligible to give some of it up later — confusing,
+        since nothing is actually pending. The underlying protection
+        (move_priority tier, the "protected" exclusion from the blanket
+        release) must survive regardless of current state, since an
+        earlier-scheduled competitor still shouldn't be able to grab it
+        via the ordinary clearance-date reallocation — only the
+        user-facing badge should hide while nothing is genuinely short.
+        """
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        scheduled = fields.Datetime.now() + relativedelta(days=30)
+        order.pick_scheduled_date = scheduled
+        order.order_line.invalidate_recordset()
+        self.assertEqual(order.order_line.move_ids.quantity, 10, "fully held")
+
+        self._create_committed_po(10, scheduled - timedelta(days=14))
+        self.env.invalidate_all()
+        self.assertEqual(
+            order.order_line.clearance_defer_reason, "Scheduled Future Stock",
+            "the underlying protection still applies even while fully held",
+        )
+        move = order.order_line.move_ids.filtered(lambda m: m.state not in ("done", "cancel"))
+        self.assertEqual(move.state, "assigned")
+        self.assertFalse(
+            move.clearance_lock_reason,
+            "the badge must not show while the line is fully held — nothing is actually pending",
+        )
+
+        # Give some of it up to an earlier-scheduled competitor — now
+        # genuinely short, the badge should show.
+        early = self._make_order(self.partner_b, 10)
+        early.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=5)
+        self.env["sale.order"]._reserve_by_clearance(product_ids=[self.product.id])
+        order.order_line.invalidate_recordset()
+        move.invalidate_recordset()
+        self.assertEqual(order.order_line.move_ids.quantity, 0, "gave up its stock")
+        self.assertEqual(
+            move.clearance_lock_reason, "Scheduled Future Stock",
+            "now genuinely short and waiting — the badge must show",
+        )
