@@ -922,11 +922,16 @@ class SaleOrder(models.Model):
             1 for m in touched if before_state.get(m.id) != (m.state, m.quantity)
         )
 
-        # One consolidated chatter note per affected order per run, rather
-        # than one post per move — a single event (a lock toggle, a
-        # payment, a receipt) can ripple across several lines/products at
-        # once, and a run touching dozens of orders (e.g. the nightly
-        # cron) would otherwise spam each one's log for no added clarity.
+        # One consolidated chatter note per affected PICKING per run,
+        # rather than one post per move — a single event (a lock toggle,
+        # a payment, a receipt) can ripple across several
+        # lines/products at once, and a run touching dozens of orders
+        # (e.g. the nightly cron) would otherwise spam each one's log
+        # for no added clarity. Posted on the picking rather than the
+        # sale order — this is physical stock movement, the picking's
+        # own concern; lock/override/payment/stage events stay on the
+        # order's chatter elsewhere in this module, since those are
+        # about the order's business status, not warehouse operations.
         # Reuses move_priority's own tier ordering to explain WHY a
         # reservation was won, not just that it happened.
         tier_labels = {
@@ -938,15 +943,19 @@ class SaleOrder(models.Model):
         changed_moves = touched.filtered(
             lambda m: before_state.get(m.id) != (m.state, m.quantity)
         )
-        by_order = {}
+        by_target = {}
         for m in changed_moves:
-            order = m.sale_line_id.order_id
-            if not order:
+            # Falls back to the order itself only if a move somehow has
+            # no picking yet — shouldn't happen for a sale-order-driven
+            # move, but never silently drop the information.
+            target = m.picking_id or m.sale_line_id.order_id
+            if not target:
                 continue
-            by_order.setdefault(order.id, self.env["stock.move"])
-            by_order[order.id] |= m
-        for order_id, moves in by_order.items():
-            order = self.env["sale.order"].browse(order_id)
+            key = (target._name, target.id)
+            by_target.setdefault(key, self.env["stock.move"])
+            by_target[key] |= m
+        for (model_name, target_id), moves in by_target.items():
+            target = self.env[model_name].browse(target_id)
             lines = []
             for m in moves:
                 before_qty = before_state.get(m.id, (None, 0))[1]
@@ -962,6 +971,6 @@ class SaleOrder(models.Model):
                         f"(reallocated to a higher-priority claim)"
                     )
             if lines:
-                order.message_post(body="Reservation queue: " + "; ".join(lines) + ".")
+                target.message_post(body="Reservation queue: " + "; ".join(lines) + ".")
 
         return {"order_count": len(orders), "reserved_move_count": changed}
