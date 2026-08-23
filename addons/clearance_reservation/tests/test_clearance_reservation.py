@@ -1253,11 +1253,13 @@ class TestClearanceBinStock(TransactionCase):
         with self.assertRaises(UserError):
             record.remove_quantity(-1)
 
-    def test_place_pallet_offers_empty_or_same_product_buffer_bins(self):
-        """The Place Pallet wizard's own location domain offers a Buffer
-        bin only if it's empty, or already tracks THIS SAME product
-        (topping up) — never one a DIFFERENT product occupies, and never
-        a bin outside Buffer Zone or Main."""
+    def test_place_pallet_offers_any_buffer_bin_regardless_of_occupancy(self):
+        """The Place Pallet wizard's own location domain offers any bin
+        under Buffer Zone or Main — empty, holding this same product, or
+        holding a different one. Explicit product decision: some
+        locations deliberately hold multiple different products, so
+        occupancy is never a reason to hide a bin — only a bin outside
+        Buffer Zone and Main is excluded."""
         buffer_zone = self.env["stock.location"].search([("name", "=", "Buffer Zone")], limit=1)
         if not buffer_zone:
             self.skipTest("No 'Buffer Zone' location configured in this database")
@@ -1285,9 +1287,10 @@ class TestClearanceBinStock(TransactionCase):
             same_product_bin.id, available_ids,
             "topping up a bin that already holds more of the SAME product must be allowed",
         )
-        self.assertNotIn(
+        self.assertIn(
             other_product_bin.id, available_ids,
-            "a bin holding a DIFFERENT product must not be offered — never mix products in a bin",
+            "some locations deliberately hold multiple products — a bin holding a "
+            "different product must still be offered",
         )
         self.assertNotIn(
             self.bin_a.id, available_ids,

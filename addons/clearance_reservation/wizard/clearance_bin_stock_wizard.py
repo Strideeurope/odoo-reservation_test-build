@@ -16,20 +16,21 @@ class ClearanceBinStockWizard(models.TransientModel):
     quantity = fields.Float(required=True)
     note = fields.Char()
     # Narrows location_id's own view domain when placing a pallet — Buffer
-    # bins (any of them) plus Main's own picking location(s), restricted
-    # to ones that are either empty or already tracking THIS SAME
-    # product. The point is never mixing two different products in one
-    # bin — topping up a bin that already holds more of the same product
-    # (including receiving straight into Main) is always fine. Left as
-    # every internal location when removing (you're taking FROM wherever
-    # something already exists, the opposite condition), and computed
-    # fresh each time since it depends on other clearance.bin.stock
-    # records, not something cleanly depends()-able.
+    # bins (any of them) plus Main's own picking location(s), the two
+    # places a pallet can legitimately be placed. Explicit product
+    # decision: no occupancy restriction — some locations deliberately
+    # hold multiple different products, so a bin already tracking
+    # something else is still offered; it's on staff to judge whether a
+    # given bin is right for what they're placing. Left as every internal
+    # location when removing (you're taking FROM wherever something
+    # already exists, the opposite condition), and computed fresh each
+    # time rather than stored, matching the rest of this module's
+    # non-stored, always-fresh compute pattern.
     available_location_ids = fields.Many2many(
         "stock.location", compute="_compute_available_location_ids"
     )
 
-    @api.depends("mode", "product_id")
+    @api.depends("mode")
     def _compute_available_location_ids(self):
         all_internal = self.env["stock.location"].search([("usage", "=", "internal")])
         candidate_zones = self._get_candidate_zones()
@@ -39,15 +40,9 @@ class ClearanceBinStockWizard(models.TransientModel):
                 ("id", "child_of", zone.id), ("usage", "=", "internal"),
             ])
         for wizard in self:
-            if wizard.mode != "add" or not candidate_bins:
-                wizard.available_location_ids = all_internal
-                continue
-            blocked = self.env["clearance.bin.stock"].search([
-                ("location_id", "in", candidate_bins.ids), ("quantity", ">", 0),
-            ])
-            if wizard.product_id:
-                blocked = blocked.filtered(lambda r: r.product_id != wizard.product_id)
-            wizard.available_location_ids = candidate_bins - blocked.location_id
+            wizard.available_location_ids = candidate_bins if (
+                wizard.mode == "add" and candidate_bins
+            ) else all_internal
 
     def _get_candidate_zones(self):
         """Buffer Zone plus wherever the Pick route actually sources
