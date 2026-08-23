@@ -64,6 +64,21 @@ class StockForecasted(models.AbstractModel):
         # than re-deriving the same lock priority logic a second time here.
         if move_out and move_out.clearance_lock_reason:
             reason = move_out.clearance_lock_reason
+            # A partially-fulfilled "Scheduled Future Stock" move splits
+            # into TWO report lines here — the already-secured chunk
+            # (this one, reservation truthy) and a separate line for the
+            # still-unfulfilled remainder (reservation falsy). The badge
+            # means "still waiting on something," true only of the
+            # remainder — the secured chunk already has what it needs,
+            # same reasoning as stock_move.py's move-level suppression
+            # for a FULLY held line, just needed again here since a
+            # partial move's own state ("partially_available") never
+            # trips that check. Never suppressed for a genuine lock
+            # (Force Reserved / Order or Product Hard Lock) — those
+            # protect the reservation itself, secured chunk included.
+            suppress_on_reserved_portion = reason == "Scheduled Future Stock" and line.get("reservation")
+            if suppress_on_reserved_portion:
+                return line
             line["lock_reason"] = reason
             # THIS line's own lock timestamp, not the order's blanket
             # queue_priority_bucket — an order can be force-reserved (or

@@ -57,7 +57,7 @@
                     t-on-click.prevent="() => this.props.openView(line.reservation._name, 'form', line.reservation.id)"
                     />
                 <button t-if="displayReserve(line)"
-                    t-attf-class="btn btn-sm ms-2 o_report_replenish_unreserve #{line.lock_reason ? 'btn-danger' : 'btn-primary'}"
+                    t-attf-class="btn btn-sm ms-2 o_report_replenish_unreserve #{this._isLockedLine(line) ? 'btn-danger' : 'btn-primary'}"
                     name="unreserve_link"
                     t-on-click="() => this._unreserve(line.move_out.id)">
                     Unreserve

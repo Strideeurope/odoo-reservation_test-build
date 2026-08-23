@@ -1075,3 +1075,47 @@ class TestClearanceReservation(TransactionCase):
             move.clearance_lock_reason, "Scheduled Future Stock",
             "now genuinely short and waiting — the badge must show",
         )
+
+    def test_scheduled_future_stock_badge_hidden_on_reserved_portion_of_split_line(self):
+        """Found via a live-data question: a partially-fulfilled
+        "Scheduled Future Stock" line produces TWO forecast report lines
+        for the same move — the already-secured chunk (reservation
+        truthy) and the still-unfulfilled remainder (reservation falsy).
+        The badge means "still waiting on something," true only of the
+        remainder; the secured chunk already has what it needs. This is
+        the same principle as the fully-held case, but that fix (keyed
+        off the move's own state) doesn't catch it, since a partially-
+        available move's state is never "assigned"."""
+        self._set_stock(6)
+        order = self._make_order(self.partner_a, 10)
+        scheduled = fields.Datetime.now() + relativedelta(days=30)
+        order.pick_scheduled_date = scheduled
+        order.order_line.invalidate_recordset()
+        self.assertEqual(order.order_line.move_ids.quantity, 6, "partially fulfilled")
+
+        self._create_committed_po(10, scheduled - timedelta(days=14))
+        self.env.invalidate_all()
+        self.assertEqual(order.order_line.clearance_defer_reason, "Scheduled Future Stock")
+
+        report = self.env["stock.forecasted_product_product"].with_context(warehouse=self.warehouse.id)
+        data = report._get_report_data(product_ids=[self.product.id])
+        lines_for_order = [
+            l for l in data["lines"]
+            if l.get("document_out") and l["document_out"].get("id") == order.id
+        ]
+        self.assertEqual(
+            len(lines_for_order), 2,
+            "expected the reserved chunk and the waiting remainder as separate lines",
+        )
+
+        reserved_line = next(l for l in lines_for_order if l.get("reservation"))
+        waiting_line = next(l for l in lines_for_order if not l.get("reservation"))
+        self.assertEqual(reserved_line["quantity"], 6)
+        self.assertFalse(
+            reserved_line.get("lock_reason"),
+            "the already-secured chunk must not show the badge",
+        )
+        self.assertEqual(
+            waiting_line.get("lock_reason"), "Scheduled Future Stock",
+            "the still-waiting remainder must show the badge",
+        )
