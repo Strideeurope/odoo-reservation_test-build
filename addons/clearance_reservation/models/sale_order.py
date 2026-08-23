@@ -595,7 +595,15 @@ class SaleOrder(models.Model):
         SINGLE combined transfer (one per Buffer/Picking zone pair) —
         one document for a warehouse staffer to act on, not a separate
         one per product.
+
+        Skipped entirely under skip_buffer_replenishment (set by
+        stock_quant.py's _apply_inventory override) — a manual inventory
+        count is a ground-truth correction, not new demand, and must
+        never be silently "fixed" by auto-pulling more stock in from
+        Buffer against it.
         """
+        if self.env.context.get("skip_buffer_replenishment"):
+            return
         needs_by_buffer_zone = {}
         for product_id, moves in by_product.items():
             outstanding = sum(

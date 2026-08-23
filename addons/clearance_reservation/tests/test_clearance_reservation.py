@@ -1220,6 +1220,38 @@ class TestClearanceReservation(TransactionCase):
             "must land at the product's own dedicated picking spot, never the flat parent zone",
         )
 
+    def test_manual_inventory_count_never_triggers_buffer_replenishment(self):
+        """Found via a live bug: a plain inventory count at either location
+        must never react to a pre-existing order shortfall by auto-pulling
+        stock in from Buffer — a count is a ground-truth correction, not
+        new demand. Two counts in particular created a doom loop live:
+        counting Buffer (routine) and correcting an over-count at Picking
+        Zone both silently triggered more stock to move, climbing higher
+        with every attempt at fixing it."""
+        # Order genuinely short at Picking Zone — no buffer configured
+        # with stock yet, so it stays unreserved (a real, pre-existing
+        # shortfall, not a fabricated one).
+        order = self._make_order(self.partner_a, 10)
+        move = order.order_line.move_ids
+        self.assertNotEqual(move.state, "assigned")
+
+        # Buffer now has plenty — but every trigger below is a plain
+        # inventory count, never a genuine new-demand event. Neither may
+        # react to the order's still-outstanding shortfall.
+        self._set_buffer_stock(50)
+        self._set_stock(0)
+
+        move.invalidate_recordset()
+        self.assertNotEqual(
+            move.state, "assigned",
+            "a manual inventory count must never trigger a buffer top-up",
+        )
+        replenishment = self.env["stock.picking"].search([
+            ("is_clearance_replenishment", "=", True),
+            ("move_ids.product_id", "=", self.product.id),
+        ])
+        self.assertFalse(replenishment, "no replenishment should ever be triggered by a manual count")
+
     def test_buffer_replenishment_moves_exact_shortfall_only(self):
         """Only the actual shortfall moves — Picking already has some
         stock, Buffer has plenty more; must top up only what's needed."""

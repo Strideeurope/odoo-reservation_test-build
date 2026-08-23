@@ -16,12 +16,25 @@ class StockQuant(models.Model):
         # scratch against current on-hand, so a downward count naturally
         # reallocates the now-scarcer stock to whoever has priority.
         #
+        # skip_buffer_replenishment: a manual count is a ground-truth
+        # correction, not new demand — it must never be silently "fixed"
+        # by auto-pulling more stock in from Buffer. Without this, someone
+        # correcting an over-count at Picking Zone down to the true figure
+        # would immediately see it pulled right back up again, since the
+        # very same order demand that originally triggered a top-up is
+        # still sitting there unchanged. Real new demand still gets its
+        # top-up from every OTHER trigger (order confirmation, a lock
+        # toggle, an incoming receipt, the nightly cron) — this only ever
+        # suppresses it for a plain recount.
+        #
         # Scoped to just the product(s) actually counted here — never a
         # full, unscoped run — since stock is reserved per product and an
         # adjustment to one product has no bearing on any other.
         product_ids = self.product_id.ids
         if product_ids:
-            self.env["sale.order"]._reserve_by_clearance(product_ids=product_ids)
+            self.env["sale.order"].with_context(
+                skip_buffer_replenishment=True
+            )._reserve_by_clearance(product_ids=product_ids)
         return res
 
     def _clearance_locked_moves(self):
