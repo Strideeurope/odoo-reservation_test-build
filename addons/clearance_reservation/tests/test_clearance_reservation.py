@@ -1253,37 +1253,63 @@ class TestClearanceBinStock(TransactionCase):
         with self.assertRaises(UserError):
             record.remove_quantity(-1)
 
-    def test_place_pallet_only_offers_empty_buffer_bins(self):
-        """The Place Pallet wizard's own location domain must only ever
-        offer Buffer bins with nothing currently tracked in them at all —
-        never a bin outside Buffer Zone, and never one another product
-        (or this same product) already occupies."""
+    def test_place_pallet_offers_empty_or_same_product_buffer_bins(self):
+        """The Place Pallet wizard's own location domain offers a Buffer
+        bin only if it's empty, or already tracks THIS SAME product
+        (topping up) — never one a DIFFERENT product occupies, and never
+        a bin outside Buffer Zone or Main."""
         buffer_zone = self.env["stock.location"].search([("name", "=", "Buffer Zone")], limit=1)
         if not buffer_zone:
             self.skipTest("No 'Buffer Zone' location configured in this database")
         empty_bin = self.env["stock.location"].create({
             "name": "Test Empty Buffer Bin", "location_id": buffer_zone.id, "usage": "internal",
         })
-        occupied_bin = self.env["stock.location"].create({
-            "name": "Test Occupied Buffer Bin", "location_id": buffer_zone.id, "usage": "internal",
+        same_product_bin = self.env["stock.location"].create({
+            "name": "Test Same-Product Buffer Bin", "location_id": buffer_zone.id, "usage": "internal",
+        })
+        self.env["clearance.bin.stock"]._get_or_create(self.product, same_product_bin).add_quantity(3)
+        other_product_bin = self.env["stock.location"].create({
+            "name": "Test Other-Product Buffer Bin", "location_id": buffer_zone.id, "usage": "internal",
         })
         other_product = self.env["product.product"].create({
             "name": "Test Bin Stock Widget — Other", "is_storable": True,
         })
-        self.env["clearance.bin.stock"]._get_or_create(other_product, occupied_bin).add_quantity(5)
+        self.env["clearance.bin.stock"]._get_or_create(other_product, other_product_bin).add_quantity(5)
 
         wizard = self.env["clearance.bin.stock.wizard"].create({
             "mode": "add", "product_id": self.product.id, "location_id": empty_bin.id, "quantity": 1,
         })
         available_ids = wizard.available_location_ids.ids
         self.assertIn(empty_bin.id, available_ids)
+        self.assertIn(
+            same_product_bin.id, available_ids,
+            "topping up a bin that already holds more of the SAME product must be allowed",
+        )
         self.assertNotIn(
-            occupied_bin.id, available_ids,
-            "a bin with ANY product's stock already tracked must not be offered",
+            other_product_bin.id, available_ids,
+            "a bin holding a DIFFERENT product must not be offered — never mix products in a bin",
         )
         self.assertNotIn(
             self.bin_a.id, available_ids,
-            "a bin outside Buffer Zone must never be offered for placing a pallet",
+            "a bin outside Buffer Zone and Main must never be offered for placing a pallet",
+        )
+
+    def test_place_pallet_includes_main_location(self):
+        """Receiving straight into Main (or topping it up) must also be
+        possible from Place Pallet — not just Buffer bins."""
+        pick_rule = self.env["stock.rule"].search(
+            [("picking_type_id", "=", self.warehouse.pick_type_id.id)], limit=1
+        )
+        main_zone = pick_rule.location_src_id or self.warehouse.lot_stock_id
+        main_bin = self.env["stock.location"].create({
+            "name": "Test Main Bin", "location_id": main_zone.id, "usage": "internal",
+        })
+        wizard = self.env["clearance.bin.stock.wizard"].create({
+            "mode": "add", "product_id": self.product.id, "location_id": main_bin.id, "quantity": 1,
+        })
+        self.assertIn(
+            main_bin.id, wizard.available_location_ids.ids,
+            "an empty bin under Main must be offered when placing a pallet",
         )
 
     def test_remove_pallet_is_not_restricted_to_buffer_zone(self):
