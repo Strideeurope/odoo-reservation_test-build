@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<templates xml:space="preserve">
+    <t t-name="clearance_reservation.ForecastedButtons" t-inherit="stock.ForecastedButtons" t-inherit-mode="extension">
+        <xpath expr="//button[@title='Update Quantity']" position="after">
+            <button title="Reserve by Clearance" t-on-click="_onClickReserveByClearance"
+                class="o_forecasted_reserve_clearance_btn btn btn-secondary">
+                Reserve by Clearance
+            </button>
+        </xpath>
+    </t>
+</templates>

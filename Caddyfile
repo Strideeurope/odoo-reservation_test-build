@@ -1,0 +1,9 @@
+{
+	servers {
+		protocols h1 h2
+	}
+}
+
+YOUR_DOMAIN_OR_IP_HERE {
+	reverse_proxy odoo:8069
+}

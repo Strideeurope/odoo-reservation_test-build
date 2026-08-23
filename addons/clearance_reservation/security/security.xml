@@ -1,0 +1,14 @@
+<odoo>
+    <record id="group_reservation_override" model="res.groups">
+        <field name="name">Reservation Override</field>
+        <field name="category_id" ref="base.module_category_inventory"/>
+    </record>
+
+    <!-- Administrators get this automatically, rather than relying on someone
+         remembering to add themselves to the group by hand — Odoo propagates
+         an implied group to a base group's existing members on write, so
+         this also self-heals if group membership is ever lost or reset. -->
+    <record id="base.group_system" model="res.groups">
+        <field name="implied_ids" eval="[(4, ref('group_reservation_override'))]"/>
+    </record>
+</odoo>

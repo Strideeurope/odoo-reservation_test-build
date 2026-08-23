@@ -1,0 +1,30 @@
+<odoo>
+    <!-- Pure safety net, not the primary mechanism: every mutation path
+         that can affect reservation (stage changes, quant adjustments,
+         incoming receipts, the native Reserve/Unreserve links, force-reserve,
+         and order-line quantity edits) already triggers a scoped
+         _reserve_by_clearance the instant it happens. This unscoped, full
+         run only matters for something outside all of those — a bulk data
+         path, a future gap, direct DB/API mutation — so it runs rarely
+         rather than polling every few minutes for work that should already
+         be done. -->
+    <record id="ir_cron_reserve_by_clearance" model="ir.cron">
+        <field name="name">Reserve stock by clearance timestamp (safety net)</field>
+        <field name="model_id" ref="sale.model_sale_order"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_reserve_by_clearance()</field>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+        <field name="active">True</field>
+    </record>
+
+    <record id="ir_cron_expire_grace_period" model="ir.cron">
+        <field name="name">Expire clearance grace period</field>
+        <field name="model_id" ref="sale.model_sale_order"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_expire_grace_period()</field>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+        <field name="active">True</field>
+    </record>
+</odoo>

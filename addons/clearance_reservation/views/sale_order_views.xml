@@ -1,0 +1,45 @@
+<odoo>
+    <record id="view_order_form_clearance" model="ir.ui.view">
+        <field name="name">sale.order.form.clearance</field>
+        <field name="model">sale.order</field>
+        <field name="inherit_id" ref="sale.view_order_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='partner_id']" position="after">
+                <field name="fulfillment_stage" widget="badge" readonly="1"
+                       decoration-muted="fulfillment_stage == 'no_invoice'"
+                       decoration-info="fulfillment_stage == 'grace_period'"
+                       decoration-warning="fulfillment_stage == 'order_pick'"
+                       decoration-success="fulfillment_stage == 'ship'"/>
+                <field name="fulfillment_stage" string="Override Stage"/>
+                <field name="clearance_date" string="Clearance Timestamp"/>
+                <field name="pick_scheduled_date"/>
+                <field name="pick_fully_validated" invisible="1"/>
+                <field name="is_reservation_hard_locked" widget="boolean_toggle"
+                       readonly="pick_fully_validated"/>
+            </xpath>
+            <!-- order_line's "sol_o2m" widget renders TWO sub-views: a <form>
+                 used only for the mobile/kanban quick-edit popup, and the
+                 actual <list> that's visible inline on the main page — the
+                 list is what needs these columns, not the form (a field
+                 added to the form alone is invisible unless that popup is
+                 opened). Scoped on the list's own @string since @name
+                 "discount" also exists inside the hidden form. -->
+            <xpath expr="//field[@name='order_line']/list/field[@name='discount']"
+                   position="after">
+                <field name="pick_fully_validated" column_invisible="1"/>
+                <field name="is_force_reserved" widget="boolean_toggle" optional="show" string="Force Reserved"
+                       readonly="pick_fully_validated"/>
+                <button name="action_force_reserve" type="object"
+                        icon="fa-play" title="Force Reserve"
+                        invisible="is_force_reserved or pick_fully_validated"/>
+                <button name="action_force_unlock_reservation" type="object"
+                        icon="fa-unlock" title="Release Force Reserve"
+                        invisible="not is_force_reserved or pick_fully_validated"/>
+                <field name="is_reservation_hard_locked" widget="boolean_toggle" optional="show"
+                       string="Hard Lock" readonly="pick_fully_validated"/>
+                <field name="clearance_defer_reason" optional="show" string="Reservation Hold"
+                       widget="badge" decoration-warning="clearance_defer_reason"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>

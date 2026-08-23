@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates id="template" xml:space="preserve">
+    <t t-name="clearance_reservation.ForecastedDetails" t-inherit="stock.ForecastedDetails" t-inherit-mode="extension">
+        <!-- Sort toggle: the table's row order is either our clearance-
+             priority sort (the server's own default, from
+             stock_forecasted.py), or one of two purely client-side
+             re-sorts of the same already-loaded lines — by the demand
+             move's own delivery date, or with locked (hard-locked /
+             force-reserved) lines pulled to the top. Switching is
+             instant, no re-fetch. -->
+        <xpath expr="//td[text()='Used by']" position="attributes">
+            <attribute name="class">d-flex justify-content-between align-items-center flex-wrap gap-2</attribute>
+        </xpath>
+        <xpath expr="//td[text()='Used by']" position="inside">
+            <div class="btn-group btn-group-sm" role="group">
+                <button type="button"
+                        t-attf-class="btn #{clearanceSortState.mode === 'clearance' ? 'btn-primary' : 'btn-outline-primary'}"
+                        t-on-click="() => this._onClickSortMode('clearance')">Clearance</button>
+                <button type="button"
+                        t-attf-class="btn #{clearanceSortState.mode === 'delivery' ? 'btn-primary' : 'btn-outline-primary'}"
+                        t-on-click="() => this._onClickSortMode('delivery')">Delivery Date</button>
+                <button type="button"
+                        t-attf-class="btn #{clearanceSortState.mode === 'locked' ? 'btn-primary' : 'btn-outline-primary'}"
+                        t-on-click="() => this._onClickSortMode('locked')">Locked First</button>
+            </div>
+        </xpath>
+        <xpath expr="//tr[@t-foreach='props.docs.lines']" position="attributes">
+            <attribute name="t-foreach">clearanceSortedLines</attribute>
+        </xpath>
+        <xpath expr="//td[@name='usedby_cell']//a[@t-if='line.document_out']" position="after">
+            <div t-if="line.document_out and line.document_out._name === 'sale.order'"
+                 class="text-muted small">
+                <span t-attf-class="badge #{this._stageBadgeClass(line.document_out.fulfillment_stage)} me-1">
+                    <t t-out="this._stageLabel(line.document_out.fulfillment_stage)"/>
+                </span>
+                <t t-if="line.document_out.clearance_date and !line.document_out.clearance_is_override">Cleared: <t t-out="line.document_out.clearance_date"/></t>
+                <t t-elif="line.document_out.clearance_date">Cleared (override)</t>
+                <t t-else="">Not yet cleared</t>
+                <span t-if="line.document_out.clearance_is_override" class="badge text-bg-info ms-1"
+                      title="This order's clearance was set by manual override, not genuine payment — a real payment will replace it">
+                    <i class="fa fa-hand-paper-o me-1"/>Clearance Override
+                </span>
+                <span t-if="line.lock_reason"
+                      t-attf-class="badge #{this._lockBadgeClass(line.lock_reason)} ms-1"
+                      t-att-title="this._lockTitle(line.lock_reason)">
+                    <i t-attf-class="fa #{this._lockIcon(line.lock_reason)} me-1"/><t t-out="line.lock_reason"/>
+                </span>
+            </div>
+        </xpath>
+        <!-- Full replace (not just the button) — keeps the native picking
+             link (useful navigation) but drops the trailing " reserved"
+             text after it, and gives the button the conditional red
+             styling. -->
+        <xpath expr="//t[@t-elif='line.reservation']" position="replace">
+            <t t-elif="line.reservation">
+                <a t-out="line.reservation.name" href="#" class="fw-bold"
+                    t-on-click.prevent="() => this.props.openView(line.reservation._name, 'form', line.reservation.id)"
+                    />
+                <button t-if="displayReserve(line)"
+                    t-attf-class="btn btn-sm ms-2 o_report_replenish_unreserve #{line.lock_reason ? 'btn-danger' : 'btn-primary'}"
+                    name="unreserve_link"
+                    t-on-click="() => this._unreserve(line.move_out.id)">
+                    Unreserve
+                </button>
+            </t>
+        </xpath>
+    </t>
+</templates>

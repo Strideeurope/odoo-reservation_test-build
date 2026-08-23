@@ -1,0 +1,49 @@
+<odoo>
+    <record id="view_picking_form_clearance" model="ir.ui.view">
+        <field name="name">stock.picking.form.clearance</field>
+        <field name="model">stock.picking</field>
+        <field name="inherit_id" ref="stock.view_picking_form"/>
+        <field name="arch" type="xml">
+            <!-- Header-level badge: the strongest lock (if any) across every
+                 line on this transfer, plus the order's own clearance
+                 timestamp — visible at a glance without opening the order. -->
+            <xpath expr="//div[hasclass('oe_title')]" position="after">
+                <div invisible="not sale_id" class="text-muted mb-2">
+                    <field name="fulfillment_stage" widget="badge" readonly="1" class="me-1"
+                           decoration-muted="fulfillment_stage == 'no_invoice'"
+                           decoration-info="fulfillment_stage == 'grace_period'"
+                           decoration-warning="fulfillment_stage == 'order_pick'"
+                           decoration-success="fulfillment_stage == 'ship'"/>
+                    <span invisible="not clearance_date or clearance_is_override">Cleared: <field name="clearance_date" nolabel="1" class="oe_inline"/></span>
+                    <span invisible="not clearance_date or not clearance_is_override">Cleared (override)</span>
+                    <span invisible="clearance_date">Not yet cleared</span>
+                    <span invisible="not clearance_lock_reason" class="badge text-bg-secondary ms-1">
+                        <i class="fa fa-lock me-1" title="Locked"/><field name="clearance_lock_reason" nolabel="1" class="oe_inline"/>
+                    </span>
+                </div>
+            </xpath>
+            <!-- Source Document becomes a real, clickable link straight to
+                 the originating sale order instead of a plain-text
+                 reference — the separate "Sales Order" field this used to
+                 sit alongside is gone, this replaces it in place. Native
+                 origin (plain Char, not always a sale order — e.g. a
+                 manually created transfer) stays as the fallback for any
+                 picking that isn't SO-driven. -->
+            <xpath expr="//field[@name='origin']" position="attributes">
+                <attribute name="invisible">sale_id</attribute>
+            </xpath>
+            <xpath expr="//field[@name='origin']" position="after">
+                <field name="sale_id" invisible="not sale_id" readonly="1" string="Source Document"/>
+            </xpath>
+            <!-- The header-level "Deadline" field, next to Scheduled Date —
+                 dropped entirely to avoid confusion with the Scheduled Date
+                 concept this module already surfaces on the sale order
+                 (pick_scheduled_date). The move-list column of the same
+                 field is already optional="hide" by default in core, so it
+                 doesn't need touching here. -->
+            <xpath expr="(//field[@name='date_deadline'])[1]" position="attributes">
+                <attribute name="invisible">1</attribute>
+            </xpath>
+        </field>
+    </record>
+</odoo>
