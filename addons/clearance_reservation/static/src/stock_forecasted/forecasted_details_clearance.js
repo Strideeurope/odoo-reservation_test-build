@@ -42,19 +42,19 @@ patch(ForecastedDetails.prototype, {
         return "This line's reservation cannot be released by any process";
     },
 
-    // Same four stages, same colors, as the badge already shown on the
-    // sale order and the Pick/Ship transfer.
-    _stageLabel(stage) {
+    // Same stages/colors as the badge already shown on the sale order
+    // and the Pick/Ship transfer. The label itself is pre-computed
+    // server-side (sale_order.py's fulfillment_stage_label) rather than
+    // re-derived here, so "No Invoice" vs "No Payment" can never drift
+    // between the two surfaces — this only decides color, keyed off the
+    // label for the no_invoice case specifically (red for a genuine
+    // no-payment situation, grey for one that's never even been
+    // invoiced) and off the raw stage for the other three.
+    _stageBadgeClass(stage, label) {
+        if (stage === "no_invoice") {
+            return label === "No Payment" ? "text-bg-danger" : "text-bg-secondary";
+        }
         return {
-            no_invoice: "No Invoice",
-            grace_period: "Grace Period",
-            order_pick: "Order / Pick",
-            ship: "Ship",
-        }[stage] || stage;
-    },
-    _stageBadgeClass(stage) {
-        return {
-            no_invoice: "text-bg-secondary",
             grace_period: "text-bg-info",
             order_pick: "text-bg-warning",
             ship: "text-bg-success",

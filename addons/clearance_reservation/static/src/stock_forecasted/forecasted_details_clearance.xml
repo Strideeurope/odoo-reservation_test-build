@@ -30,8 +30,8 @@
         <xpath expr="//td[@name='usedby_cell']//a[@t-if='line.document_out']" position="after">
             <div t-if="line.document_out and line.document_out._name === 'sale.order'"
                  class="text-muted small">
-                <span t-attf-class="badge #{this._stageBadgeClass(line.document_out.fulfillment_stage)} me-1">
-                    <t t-out="this._stageLabel(line.document_out.fulfillment_stage)"/>
+                <span t-attf-class="badge #{this._stageBadgeClass(line.document_out.fulfillment_stage, line.document_out.fulfillment_stage_label)} me-1">
+                    <t t-out="line.document_out.fulfillment_stage_label"/>
                 </span>
                 <t t-if="line.document_out.clearance_date and !line.document_out.clearance_is_override">Cleared: <t t-out="line.document_out.clearance_date"/></t>
                 <t t-elif="line.document_out.clearance_date">Cleared (override)</t>

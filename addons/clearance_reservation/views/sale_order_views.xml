@@ -5,8 +5,9 @@
         <field name="inherit_id" ref="sale.view_order_form"/>
         <field name="arch" type="xml">
             <xpath expr="//field[@name='partner_id']" position="after">
-                <field name="fulfillment_stage" widget="badge" readonly="1"
-                       decoration-muted="fulfillment_stage == 'no_invoice'"
+                <field name="fulfillment_stage_label" string="Fulfillment Stage" widget="badge" readonly="1"
+                       decoration-muted="fulfillment_stage_label == 'No Invoice'"
+                       decoration-danger="fulfillment_stage_label == 'No Payment'"
                        decoration-info="fulfillment_stage == 'grace_period'"
                        decoration-warning="fulfillment_stage == 'order_pick'"
                        decoration-success="fulfillment_stage == 'ship'"/>
@@ -27,18 +28,16 @@
             <xpath expr="//field[@name='order_line']/list/field[@name='discount']"
                    position="after">
                 <field name="pick_fully_validated" column_invisible="1"/>
+                <!-- The toggle alone triggers/releases force-reserve —
+                     writing is_force_reserved goes through the exact
+                     same write() hook (re-runs the queue immediately,
+                     correctly locking an already-assigned move too) as
+                     action_force_reserve() itself did, making the
+                     separate action buttons redundant. -->
                 <field name="is_force_reserved" widget="boolean_toggle" optional="show" string="Force Reserved"
                        readonly="pick_fully_validated"/>
-                <button name="action_force_reserve" type="object"
-                        icon="fa-play" title="Force Reserve"
-                        invisible="is_force_reserved or pick_fully_validated"/>
-                <button name="action_force_unlock_reservation" type="object"
-                        icon="fa-unlock" title="Release Force Reserve"
-                        invisible="not is_force_reserved or pick_fully_validated"/>
                 <field name="is_reservation_hard_locked" widget="boolean_toggle" optional="show"
                        string="Hard Lock" readonly="pick_fully_validated"/>
-                <field name="clearance_defer_reason" optional="show" string="Reservation Hold"
-                       widget="badge" decoration-warning="clearance_defer_reason"/>
             </xpath>
         </field>
     </record>

@@ -46,8 +46,12 @@ class StockForecasted(models.AbstractModel):
             document_out["clearance_is_override"] = order.clearance_is_override
             # Same fulfillment-stage badge already shown on the sale
             # order and the Pick/Ship transfer — surfaced here too so
-            # it's visible without leaving the forecast.
+            # it's visible without leaving the forecast. The label is
+            # pre-computed server-side (see sale_order.py) rather than
+            # re-derived in JS, so "No Invoice" vs "No Payment" can never
+            # drift between the two surfaces.
             document_out["fulfillment_stage"] = order.fulfillment_stage
+            document_out["fulfillment_stage_label"] = order.fulfillment_stage_label
 
         # move_out here is the actual demand move (the "out" that
         # _get_report_lines is building this line for), not the possibly-

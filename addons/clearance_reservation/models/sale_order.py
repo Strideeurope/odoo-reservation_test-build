@@ -26,7 +26,7 @@ class SaleOrder(models.Model):
 
     fulfillment_stage = fields.Selection(
         [
-            ("no_invoice", "No Invoice"),
+            ("no_invoice", "No Payment"),
             ("grace_period", "Grace Period"),
             ("order_pick", "Order / Pick"),
             ("ship", "Ship"),
@@ -35,6 +35,16 @@ class SaleOrder(models.Model):
         copy=False,
         tracking=True,
     )
+    # Purely a display refinement — the technical "no_invoice" value and
+    # every domain/eligibility check in this module still use it exactly
+    # as before; creating an invoice never touches fulfillment_stage and
+    # must never trigger any reservation/allocation on its own. The
+    # technical stage covers two different real situations that used to
+    # share one misleading label: genuinely never invoiced at all ("No
+    # Invoice"), or invoiced but not currently paid — including a fully
+    # refunded order, which obviously DOES have an invoice ("No
+    # Payment"). Computed fresh from current invoice_ids, never stored.
+    fulfillment_stage_label = fields.Char(compute="_compute_fulfillment_stage_label")
     # Not field-level readonly: protection comes entirely from write()'s own
     # permission gate below (same pattern as fulfillment_stage), so that a
     # dedicated, explicitly-editable "Override Clearance Timestamp" field
@@ -109,6 +119,22 @@ class SaleOrder(models.Model):
         string="Scheduled Date", compute="_compute_pick_scheduled_date",
         inverse="_inverse_pick_scheduled_date",
     )
+
+    def _fulfillment_stage_label_for(self, stage):
+        """The label to actually show for a given raw fulfillment_stage
+        value — single source of truth used by the compute below AND by
+        every chatter message that names a stage, so the two can never
+        drift out of sync. Never used for eligibility/domain logic
+        anywhere in this module — purely what gets displayed."""
+        self.ensure_one()
+        if stage == "no_invoice":
+            return "No Payment" if self.invoice_ids else "No Invoice"
+        return dict(self._fields["fulfillment_stage"].selection).get(stage, stage)
+
+    @api.depends("fulfillment_stage", "invoice_ids")
+    def _compute_fulfillment_stage_label(self):
+        for order in self:
+            order.fulfillment_stage_label = order._fulfillment_stage_label_for(order.fulfillment_stage)
 
     @api.depends("picking_ids.state", "picking_ids.picking_type_id")
     def _compute_pick_fully_validated(self):
@@ -261,13 +287,18 @@ class SaleOrder(models.Model):
                 # _resolve_clearance_date.
                 for order in self.filtered("clearance_date"):
                     backed_up = order.clearance_date
+                    # Computed per order, BEFORE the write below, since
+                    # whether this order has any invoices decides "No
+                    # Invoice" vs "No Payment" — not the same for every
+                    # order in a batch override, unlike the other stages.
+                    order_stage_label = order._fulfillment_stage_label_for("no_invoice")
                     order.with_context(clearance_internal_write=True).write({
                         "clearance_date": False,
                         "clearance_date_backup": order.clearance_date,
                         "clearance_is_override": False,
                     })
                     order.message_post(body=(
-                        f"Manual override: moved to {stage_label}. Clearance "
+                        f"Manual override: moved to {order_stage_label}. Clearance "
                         f"timestamp ({backed_up}) backed up rather than discarded — "
                         f"restored automatically if payment resumes or it's "
                         f"overridden forward again."
@@ -401,7 +432,8 @@ class SaleOrder(models.Model):
         for order in expired:
             order.message_post(body=(
                 f"Grace period expired ({GRACE_PERIOD_DAYS} days unpaid since "
-                f"{order.clearance_date}) — demoted to No Invoice. Clearance "
+                f"{order.clearance_date}) — demoted to "
+                f"{order._fulfillment_stage_label_for('no_invoice')}. Clearance "
                 f"timestamp discarded with no backup kept; a later genuine "
                 f"payment starts fresh, not from this timestamp."
             ))
@@ -528,10 +560,11 @@ class SaleOrder(models.Model):
                     "clearance_is_override": False,
                 })
                 order.message_post(body=(
-                    f"Payment fully reversed — demoted to No Invoice, no genuine "
-                    f"claim on stock left. Clearance timestamp ({backed_up}) "
-                    f"backed up, restored automatically if it's genuinely paid "
-                    f"again."
+                    f"Payment fully reversed — demoted to "
+                    f"{order._fulfillment_stage_label_for('no_invoice')}, no "
+                    f"genuine claim on stock left. Clearance timestamp "
+                    f"({backed_up}) backed up, restored automatically if it's "
+                    f"genuinely paid again."
                 ))
 
     def _resolve_clearance_date(self, fresh_timestamp):

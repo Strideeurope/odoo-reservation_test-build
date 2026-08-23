@@ -9,8 +9,10 @@
                  timestamp — visible at a glance without opening the order. -->
             <xpath expr="//div[hasclass('oe_title')]" position="after">
                 <div invisible="not sale_id" class="text-muted mb-2">
-                    <field name="fulfillment_stage" widget="badge" readonly="1" class="me-1"
-                           decoration-muted="fulfillment_stage == 'no_invoice'"
+                    <field name="fulfillment_stage" invisible="1"/>
+                    <field name="fulfillment_stage_label" widget="badge" readonly="1" class="me-1"
+                           decoration-muted="fulfillment_stage_label == 'No Invoice'"
+                           decoration-danger="fulfillment_stage_label == 'No Payment'"
                            decoration-info="fulfillment_stage == 'grace_period'"
                            decoration-warning="fulfillment_stage == 'order_pick'"
                            decoration-success="fulfillment_stage == 'ship'"/>

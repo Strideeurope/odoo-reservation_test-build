@@ -8,6 +8,7 @@ class StockPicking(models.Model):
     clearance_date = fields.Datetime(related="sale_id.clearance_date", string="Clearance Timestamp")
     clearance_is_override = fields.Boolean(related="sale_id.clearance_is_override")
     fulfillment_stage = fields.Selection(related="sale_id.fulfillment_stage", string="Fulfillment Stage")
+    fulfillment_stage_label = fields.Char(related="sale_id.fulfillment_stage_label")
     # Summarizes across every line on this picking, most severe first — a
     # picking can have several lines with different lock states, but the
     # header badge only needs to flag the strongest one; the per-line badge
