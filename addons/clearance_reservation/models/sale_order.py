@@ -596,7 +596,7 @@ class SaleOrder(models.Model):
         one document for a warehouse staffer to act on, not a separate
         one per product.
         """
-        needs_by_zone_pair = {}
+        needs_by_buffer_zone = {}
         for product_id, moves in by_product.items():
             outstanding = sum(
                 max(0, m.product_uom_qty - m.quantity) for m in moves
@@ -627,28 +627,45 @@ class SaleOrder(models.Model):
             qty = min(shortfall, buffer_free)
             if qty <= 0:
                 continue
-            needs_by_zone_pair.setdefault((buffer_zone.id, picking_zone.id), []).append((product, qty))
+            destination = self._resolve_buffer_replenishment_destination(product, picking_zone)
+            needs_by_buffer_zone.setdefault(buffer_zone.id, []).append((product, qty, destination))
 
-        for (buffer_zone_id, picking_zone_id), needs in needs_by_zone_pair.items():
-            self._create_buffer_replenishment(
-                needs,
-                self.env["stock.location"].browse(buffer_zone_id),
-                self.env["stock.location"].browse(picking_zone_id),
-            )
+        for buffer_zone_id, needs in needs_by_buffer_zone.items():
+            self._create_buffer_replenishment(needs, self.env["stock.location"].browse(buffer_zone_id))
 
-    def _create_buffer_replenishment(self, needs, buffer_zone, picking_zone):
+    def _resolve_buffer_replenishment_destination(self, product, picking_zone):
+        """The exact sub-location to land replenished stock at — the
+        product's own existing picking spot under Picking Zone, matching
+        the "one dedicated picking location per product" layout, never
+        the flat parent zone itself, which would scatter replenished
+        stock away from where a picker actually looks for this product.
+        Deliberately not filtered on current on-hand quantity — the
+        product's spot being genuinely empty right now (Picking Zone ran
+        short) is exactly the scenario being replenished for, so a
+        zero-quantity quant there must still count as "this is the
+        spot." Falls back to the parent Picking Zone only when the
+        product has no picking sub-location on record at all yet."""
+        existing = self.env["stock.quant"].search([
+            ("product_id", "=", product.id),
+            ("location_id", "child_of", picking_zone.id),
+            ("location_id", "!=", picking_zone.id),
+        ], limit=1)
+        return existing.location_id if existing else picking_zone
+
+    def _create_buffer_replenishment(self, needs, buffer_zone):
         """Create, reserve, and immediately validate ONE internal transfer
-        moving every (product, qty) in `needs` from Buffer Zone to Picking
-        Zone — a real stock.move per product, not raw SQL, so on-hand/
-        reserved figures stay internally consistent (see stock_quant.py's
-        move_quants override for the same principle applied to manual
-        reorganization), all on one transfer document rather than one
-        per product."""
-        warehouse = buffer_zone.warehouse_id or picking_zone.warehouse_id
+        moving every (product, qty, destination) in `needs` from Buffer
+        Zone to each product's own resolved destination — a real
+        stock.move per product, not raw SQL, so on-hand/reserved figures
+        stay internally consistent (see stock_quant.py's move_quants
+        override for the same principle applied to manual reorganization),
+        all on one transfer document rather than one per product."""
+        default_destination = needs[0][2]
+        warehouse = buffer_zone.warehouse_id or default_destination.warehouse_id
         internal_type = warehouse.int_type_id if warehouse else False
         picking_vals = {
             "location_id": buffer_zone.id,
-            "location_dest_id": picking_zone.id,
+            "location_dest_id": default_destination.id,
             "origin": "Clearance Auto-Replenishment",
             "is_clearance_replenishment": True,
         }
@@ -656,24 +673,27 @@ class SaleOrder(models.Model):
             picking_vals["picking_type_id"] = internal_type.id
         picking = self.env["stock.picking"].create(picking_vals)
         moves = self.env["stock.move"]
-        for product, qty in needs:
+        for product, qty, destination in needs:
             moves |= self.env["stock.move"].create({
                 "name": f"Auto-replenish {product.display_name}",
                 "product_id": product.id,
                 "product_uom_qty": qty,
                 "product_uom": product.uom_id.id,
                 "location_id": buffer_zone.id,
-                "location_dest_id": picking_zone.id,
+                "location_dest_id": destination.id,
                 "picking_id": picking.id,
             })
         moves._action_confirm()
         moves._action_assign()
         moves.move_line_ids.write({"picked": True})
         moves._action_done()
-        detail = ", ".join(f"{qty} × {product.display_name}" for product, qty in needs)
+        detail = ", ".join(
+            f"{qty} × {product.display_name} → {destination.display_name}"
+            for product, qty, destination in needs
+        )
         picking.message_post(body=(
             f"Auto-replenishment: moved {detail} from {buffer_zone.display_name} "
-            f"to {picking_zone.display_name} to cover pending demand."
+            f"to cover pending demand."
         ))
         return picking
 

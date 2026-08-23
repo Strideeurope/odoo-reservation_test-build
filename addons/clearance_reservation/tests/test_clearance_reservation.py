@@ -1186,6 +1186,40 @@ class TestClearanceReservation(TransactionCase):
             "must be immediately validated, not left pending for a human",
         )
 
+    def test_buffer_replenishment_lands_at_products_existing_picking_sub_location(self):
+        """Found via live data: replenishment must never dump stock into
+        the flat parent Picking Zone location when the product already
+        has its own dedicated picking sub-location — that scatters it
+        away from where a picker actually looks for this product ("one
+        dedicated picking location per product"). The spot being
+        currently empty (a zero-quantity quant) must still count as
+        "this is the spot" — that's exactly the shortfall being
+        replenished for."""
+        product_spot = self.env["stock.location"].create({
+            "name": "Test Product A Spot",
+            "location_id": self.pick_source_location.id,
+            "usage": "internal",
+        })
+        self.env["stock.quant"].create({
+            "product_id": self.product.id,
+            "location_id": product_spot.id,
+        })
+        self._set_buffer_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        move = order.order_line.move_ids
+        self.assertEqual(move.state, "assigned")
+
+        replenishment_moves = self.env["stock.move"].search([
+            ("location_id", "=", self.buffer_location.id),
+            ("product_id", "=", self.product.id),
+            ("state", "=", "done"),
+        ])
+        self.assertTrue(replenishment_moves)
+        self.assertEqual(
+            replenishment_moves.location_dest_id, product_spot,
+            "must land at the product's own dedicated picking spot, never the flat parent zone",
+        )
+
     def test_buffer_replenishment_moves_exact_shortfall_only(self):
         """Only the actual shortfall moves — Picking already has some
         stock, Buffer has plenty more; must top up only what's needed."""
