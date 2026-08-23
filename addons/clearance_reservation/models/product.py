@@ -76,3 +76,38 @@ class ProductProduct(models.Model):
             "domain": [("product_id", "=", self.id)],
             "context": {"default_product_id": self.id},
         }
+
+    @api.model
+    def action_view_bin_stock_discrepancies(self):
+        """Every product with at least one tracked bin where the tracked
+        total doesn't match real stock. bin_stock_discrepancy isn't a
+        stored field (it depends on live stock movements, which aren't
+        cleanly dependency-trackable), so it can't be used directly in a
+        domain — computed here in Python instead, scoped to only the
+        products that actually have a clearance.bin.stock record at all
+        (no need to touch every product in the database)."""
+        tracked_product_ids = self.env["clearance.bin.stock"].search([]).product_id.ids
+        products = self.browse(set(tracked_product_ids))
+        mismatched = products.filtered(lambda p: p.bin_stock_discrepancy)
+        return {
+            "type": "ir.actions.act_window",
+            "name": "Bin Stock Discrepancies",
+            "res_model": "product.product",
+            "view_mode": "list,form",
+            "views": [(
+                self.env.ref("clearance_reservation.view_product_bin_stock_discrepancies_list").id,
+                "list",
+            ), (False, "form")],
+            "domain": [("id", "in", mismatched.ids)],
+        }
+
+    def action_open_bin_stock_reconcile(self):
+        self.ensure_one()
+        return {
+            "type": "ir.actions.act_window",
+            "name": f"Reconcile Bin Stock — {self.display_name}",
+            "res_model": "clearance.bin.stock.reconcile.wizard",
+            "view_mode": "form",
+            "target": "new",
+            "context": {"default_product_id": self.id},
+        }

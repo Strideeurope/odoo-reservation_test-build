@@ -76,6 +76,62 @@
         <field name="context">{'default_mode': 'remove'}</field>
     </record>
 
+    <!-- Discrepancies report: product.product rows, not clearance.bin.stock
+         — the mismatch is a per-product figure (tracked total vs. real
+         stock), not something any single bin record can show on its own.
+         A dedicated list view scoped ONLY to this action's own view_id,
+         so it never affects any other product list elsewhere. -->
+    <record id="view_product_bin_stock_discrepancies_list" model="ir.ui.view">
+        <field name="name">product.product.bin.stock.discrepancies.list</field>
+        <field name="model">product.product</field>
+        <field name="arch" type="xml">
+            <list create="0" delete="0" default_order="id">
+                <field name="display_name" string="Product"/>
+                <field name="bin_stock_total" string="Tracked"/>
+                <field name="bin_stock_reference_qty" string="On Hand (excl. Output)"/>
+                <field name="bin_stock_discrepancy" string="Discrepancy" decoration-danger="bin_stock_discrepancy"/>
+                <button name="action_open_bin_stock_reconcile" type="object" string="Reconcile" class="btn-link"/>
+            </list>
+        </field>
+    </record>
+
+    <!-- Dynamic domain (which products currently mismatch) can't be
+         expressed as a static act_window domain, since the comparison
+         isn't a stored/searchable field — routed through a server action
+         that calls action_view_bin_stock_discrepancies() and returns its
+         result. -->
+    <record id="action_bin_stock_discrepancies_server" model="ir.actions.server">
+        <field name="name">Bin Stock Discrepancies</field>
+        <field name="model_id" ref="product.model_product_product"/>
+        <field name="state">code</field>
+        <field name="code">action = model.action_view_bin_stock_discrepancies()</field>
+    </record>
+
+    <record id="view_clearance_bin_stock_reconcile_wizard_form" model="ir.ui.view">
+        <field name="name">clearance.bin.stock.reconcile.wizard.form</field>
+        <field name="model">clearance.bin.stock.reconcile.wizard</field>
+        <field name="arch" type="xml">
+            <form>
+                <group>
+                    <field name="product_id" readonly="1"/>
+                    <field name="bin_stock_total" readonly="1"/>
+                    <field name="reference_qty" readonly="1"/>
+                    <field name="discrepancy" readonly="1"/>
+                </group>
+                <group>
+                    <field name="resolution"/>
+                    <field name="location_id" invisible="resolution != 'fix_bin'"
+                           required="resolution == 'fix_bin'"/>
+                    <field name="note" placeholder="Optional note"/>
+                </group>
+                <footer>
+                    <button name="action_confirm" type="object" string="Confirm" class="btn-primary"/>
+                    <button special="cancel" string="Cancel" class="btn-secondary"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
     <menuitem id="menu_clearance_bin_stock_root" name="Bin Stock" parent="stock.menu_stock_root" sequence="60"/>
     <menuitem id="menu_clearance_bin_stock" name="Bin Stock" parent="menu_clearance_bin_stock_root"
               action="action_clearance_bin_stock" sequence="10"/>
@@ -83,4 +139,6 @@
               action="action_clearance_bin_stock_place" sequence="20"/>
     <menuitem id="menu_clearance_bin_stock_remove" name="Remove Pallet" parent="menu_clearance_bin_stock_root"
               action="action_clearance_bin_stock_remove" sequence="30"/>
+    <menuitem id="menu_clearance_bin_stock_discrepancies" name="Discrepancies" parent="menu_clearance_bin_stock_root"
+              action="action_bin_stock_discrepancies_server" sequence="40"/>
 </odoo>

@@ -1312,3 +1312,166 @@ class TestClearanceBinStock(TransactionCase):
             self.product.bin_stock_discrepancy, 5,
             "tracked total now exceeds real on-hand — should surface as a mismatch to investigate",
         )
+
+    def test_discrepancies_report_only_lists_mismatched_tracked_products(self):
+        """The report scopes to products that actually have a
+        clearance.bin.stock record at all, and within those, only ones
+        whose tracked total doesn't match real stock — never every
+        product in the database, and never a product that's fine."""
+        mismatched_product = self.product
+
+        matching_product = self.env["product.product"].create({
+            "name": "Test Bin Stock Widget — Matching", "is_storable": True,
+        })
+        matching_bin = self.env["stock.location"].create({
+            "name": "Test Bin Matching", "location_id": self.warehouse.view_location_id.id,
+            "usage": "internal",
+        })
+        self.env["clearance.bin.stock"]._get_or_create(matching_product, matching_bin).add_quantity(10)
+        # Real stock must also be 10 for this product to genuinely have
+        # zero discrepancy — without this, tracked (10) vs real (0)
+        # would itself be a mismatch, defeating the point of this fixture.
+        pick_rule = self.env["stock.rule"].search(
+            [("picking_type_id", "=", self.warehouse.pick_type_id.id)], limit=1
+        )
+        main_location = pick_rule.location_src_id or self.warehouse.lot_stock_id
+        matching_quant = self.env["stock.quant"].create({
+            "product_id": matching_product.id, "location_id": main_location.id,
+        })
+        matching_quant.with_context(inventory_mode=True).write({"inventory_quantity": 10})
+        matching_quant.action_apply_inventory()
+
+        untracked_product = self.env["product.product"].create({
+            "name": "Test Bin Stock Widget — Untracked", "is_storable": True,
+        })
+
+        self.env["clearance.bin.stock"]._get_or_create(mismatched_product, self.bin_a).add_quantity(10)
+
+        action = self.env["product.product"].action_view_bin_stock_discrepancies()
+        # Extract the ('id', 'in', [...]) domain term directly.
+        result_ids = next(term[2] for term in action["domain"] if term[0] == "id")
+
+        self.assertIn(mismatched_product.id, result_ids)
+        self.assertNotIn(matching_product.id, result_ids, "a product with no discrepancy must not appear")
+        self.assertNotIn(untracked_product.id, result_ids, "a product with no bin stock at all must not appear")
+
+    def test_reconcile_fix_bin_corrects_tracked_count(self):
+        """Resolving via 'fix_bin' treats the tracker as wrong — it
+        corrects the chosen bin's tracked quantity to bring the total
+        back in line with real stock, touching no real stock.quant."""
+        warehouse = self.warehouse
+        pick_rule = self.env["stock.rule"].search(
+            [("picking_type_id", "=", warehouse.pick_type_id.id)], limit=1
+        )
+        main_location = pick_rule.location_src_id or warehouse.lot_stock_id
+        real_quant = self.env["stock.quant"].create({
+            "product_id": self.product.id, "location_id": main_location.id,
+        })
+        real_quant.with_context(inventory_mode=True).write({"inventory_quantity": 20})
+        real_quant.action_apply_inventory()
+
+        bin_record = self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a)
+        bin_record.add_quantity(30)  # tracker over-counts by 10
+        self.product.invalidate_recordset()
+        self.assertEqual(self.product.bin_stock_discrepancy, 10)
+
+        wizard = self.env["clearance.bin.stock.reconcile.wizard"].create({
+            "product_id": self.product.id,
+            "resolution": "fix_bin",
+            "location_id": self.bin_a.id,
+        })
+        wizard.action_confirm()
+
+        self.assertEqual(bin_record.quantity, 20, "the excess 10 should be removed from the chosen bin")
+        self.product.invalidate_recordset()
+        self.assertEqual(self.product.bin_stock_discrepancy, 0)
+        real_quant.invalidate_recordset()
+        self.assertEqual(real_quant.quantity, 20, "fix_bin must never touch real stock")
+
+    def test_reconcile_fix_stock_adjusts_real_stock(self):
+        """Resolving via 'fix_stock' treats the tracker as right — it
+        creates a real inventory adjustment on Main instead, leaving
+        every clearance.bin.stock record untouched."""
+        warehouse = self.warehouse
+        pick_rule = self.env["stock.rule"].search(
+            [("picking_type_id", "=", warehouse.pick_type_id.id)], limit=1
+        )
+        main_location = pick_rule.location_src_id or warehouse.lot_stock_id
+        real_quant = self.env["stock.quant"].create({
+            "product_id": self.product.id, "location_id": main_location.id,
+        })
+        real_quant.with_context(inventory_mode=True).write({"inventory_quantity": 20})
+        real_quant.action_apply_inventory()
+
+        bin_record = self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a)
+        bin_record.add_quantity(30)  # tracker says 30, real stock says 20
+        self.product.invalidate_recordset()
+        self.assertEqual(self.product.bin_stock_discrepancy, 10)
+
+        wizard = self.env["clearance.bin.stock.reconcile.wizard"].create({
+            "product_id": self.product.id,
+            "resolution": "fix_stock",
+        })
+        wizard.action_confirm()
+
+        real_quant.invalidate_recordset()
+        self.assertEqual(real_quant.quantity, 30, "real stock should be raised to match the tracker")
+        self.assertEqual(bin_record.quantity, 30, "fix_stock must never touch the tracker")
+        self.product.invalidate_recordset()
+        self.assertEqual(self.product.bin_stock_discrepancy, 0)
+
+    def test_reconcile_fix_stock_lands_at_products_existing_picking_sub_location(self):
+        """Found via live data once already for auto-replenishment, and
+        found again here: an inventory adjustment from fix_stock must
+        land at the product's own dedicated picking sub-location, never
+        the flat parent Pick-route location, when one already exists."""
+        pick_rule = self.env["stock.rule"].search(
+            [("picking_type_id", "=", self.warehouse.pick_type_id.id)], limit=1
+        )
+        picking_zone = pick_rule.location_src_id or self.warehouse.lot_stock_id
+        product_spot = self.env["stock.location"].create({
+            "name": "Test Product Spot", "location_id": picking_zone.id, "usage": "internal",
+        })
+        real_quant = self.env["stock.quant"].create({
+            "product_id": self.product.id, "location_id": product_spot.id,
+        })
+        real_quant.with_context(inventory_mode=True).write({"inventory_quantity": 20})
+        real_quant.action_apply_inventory()
+
+        self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a).add_quantity(30)
+        self.product.invalidate_recordset()
+        self.assertEqual(self.product.bin_stock_discrepancy, 10)
+
+        wizard = self.env["clearance.bin.stock.reconcile.wizard"].create({
+            "product_id": self.product.id,
+            "resolution": "fix_stock",
+        })
+        wizard.action_confirm()
+
+        real_quant.invalidate_recordset()
+        self.assertEqual(
+            real_quant.quantity, 30,
+            "must land at the product's own dedicated picking spot, never the flat parent zone",
+        )
+        flat_quant = self.env["stock.quant"].search([
+            ("product_id", "=", self.product.id), ("location_id", "=", picking_zone.id),
+        ])
+        self.assertFalse(flat_quant, "must never create a stray quant at the flat parent location")
+
+    def test_reconcile_fix_bin_requires_location(self):
+        self.env["clearance.bin.stock"]._get_or_create(self.product, self.bin_a).add_quantity(10)
+        wizard = self.env["clearance.bin.stock.reconcile.wizard"].create({
+            "product_id": self.product.id,
+            "resolution": "fix_bin",
+        })
+        with self.assertRaises(UserError):
+            wizard.action_confirm()
+
+    def test_reconcile_raises_when_nothing_to_resolve(self):
+        wizard = self.env["clearance.bin.stock.reconcile.wizard"].create({
+            "product_id": self.product.id,
+            "resolution": "fix_bin",
+            "location_id": self.bin_a.id,
+        })
+        with self.assertRaises(UserError):
+            wizard.action_confirm()

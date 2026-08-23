@@ -21,6 +21,17 @@
                    position="replace">
                 <field name="bin_stock_reference_qty" nolabel="1" class="oe_inline"/>
             </xpath>
+            <div name="button_box" position="after">
+                <div class="alert alert-danger d-flex align-items-center justify-content-between"
+                     role="alert" invisible="not bin_stock_discrepancy">
+                    <span>
+                        Bin stock doesn't match real stock — off by
+                        <field name="bin_stock_discrepancy" nolabel="1" class="oe_inline fw-bold"/>.
+                    </span>
+                    <button name="action_open_bin_stock_reconcile" type="object"
+                            string="Reconcile" class="btn-danger"/>
+                </div>
+            </div>
         </field>
     </record>
 </odoo>
