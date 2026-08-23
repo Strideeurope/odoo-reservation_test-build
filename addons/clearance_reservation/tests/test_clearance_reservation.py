@@ -1253,6 +1253,51 @@ class TestClearanceBinStock(TransactionCase):
         with self.assertRaises(UserError):
             record.remove_quantity(-1)
 
+    def test_place_pallet_only_offers_empty_buffer_bins(self):
+        """The Place Pallet wizard's own location domain must only ever
+        offer Buffer bins with nothing currently tracked in them at all —
+        never a bin outside Buffer Zone, and never one another product
+        (or this same product) already occupies."""
+        buffer_zone = self.env["stock.location"].search([("name", "=", "Buffer Zone")], limit=1)
+        if not buffer_zone:
+            self.skipTest("No 'Buffer Zone' location configured in this database")
+        empty_bin = self.env["stock.location"].create({
+            "name": "Test Empty Buffer Bin", "location_id": buffer_zone.id, "usage": "internal",
+        })
+        occupied_bin = self.env["stock.location"].create({
+            "name": "Test Occupied Buffer Bin", "location_id": buffer_zone.id, "usage": "internal",
+        })
+        other_product = self.env["product.product"].create({
+            "name": "Test Bin Stock Widget — Other", "is_storable": True,
+        })
+        self.env["clearance.bin.stock"]._get_or_create(other_product, occupied_bin).add_quantity(5)
+
+        wizard = self.env["clearance.bin.stock.wizard"].create({
+            "mode": "add", "product_id": self.product.id, "location_id": empty_bin.id, "quantity": 1,
+        })
+        available_ids = wizard.available_location_ids.ids
+        self.assertIn(empty_bin.id, available_ids)
+        self.assertNotIn(
+            occupied_bin.id, available_ids,
+            "a bin with ANY product's stock already tracked must not be offered",
+        )
+        self.assertNotIn(
+            self.bin_a.id, available_ids,
+            "a bin outside Buffer Zone must never be offered for placing a pallet",
+        )
+
+    def test_remove_pallet_is_not_restricted_to_buffer_zone(self):
+        """Remove mode is the opposite situation — you're taking stock
+        FROM wherever it already exists, which could be any bin — so it
+        must not inherit Place Pallet's empty-Buffer-only restriction."""
+        wizard = self.env["clearance.bin.stock.wizard"].create({
+            "mode": "remove", "product_id": self.product.id, "location_id": self.bin_a.id, "quantity": 1,
+        })
+        self.assertIn(
+            self.bin_a.id, wizard.available_location_ids.ids,
+            "remove mode must not be restricted to Buffer Zone",
+        )
+
     def test_changes_never_touch_real_stock_or_reservation(self):
         """The whole point of this model: logging bin stock must never
         create, modify, or otherwise interact with any stock.quant, and

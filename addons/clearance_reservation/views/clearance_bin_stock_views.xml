@@ -44,9 +44,10 @@
         <field name="arch" type="xml">
             <form>
                 <field name="mode" invisible="1"/>
+                <field name="available_location_ids" invisible="1"/>
                 <group>
                     <field name="product_id"/>
-                    <field name="location_id"/>
+                    <field name="location_id" domain="[('id', 'in', available_location_ids)]"/>
                     <field name="quantity"/>
                     <field name="note" placeholder="Optional note"/>
                 </group>
