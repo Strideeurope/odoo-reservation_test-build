@@ -245,12 +245,29 @@ class StockForecasted(models.AbstractModel):
         no_clearance_ids = {id(line) for line in no_clearance_force_reserved}
 
         rest_unreserved = [line for line in unreserved_lines if id(line) not in no_clearance_ids]
+
+        # Within THIS remaining group, a genuinely cleared (paid) order
+        # must still rank above one that was never even cleared — being
+        # unreserved doesn't erase that difference. Without this, an
+        # uncleared no_invoice order with an early delivery date could
+        # sort ahead of a paid, cleared order that's simply waiting on
+        # more stock — clearance status is a more fundamental signal
+        # than "needed soonest" once you're comparing across cleared and
+        # uncleared, even though NEITHER currently holds anything.
+        # Delivery date only breaks ties WITHIN each of the two groups.
+        cleared_unreserved = [line for line in rest_unreserved if line_clearance_date(line) is not None]
+        uncleared_unreserved = [line for line in rest_unreserved if line_clearance_date(line) is None]
+
         # Python's sort is stable, so ties (including "no delivery date at
         # all") keep their original relative order.
-        rest_unreserved_sorted = sorted(
-            rest_unreserved,
-            key=lambda line: (0, line_delivery_date(line)) if line_delivery_date(line) else (1, ""),
-        )
+        def by_delivery_date(line):
+            return (0, line_delivery_date(line)) if line_delivery_date(line) else (1, "")
 
-        res["lines"] = reserved_sorted + no_clearance_force_reserved + rest_unreserved_sorted
+        cleared_unreserved_sorted = sorted(cleared_unreserved, key=by_delivery_date)
+        uncleared_unreserved_sorted = sorted(uncleared_unreserved, key=by_delivery_date)
+
+        res["lines"] = (
+            reserved_sorted + no_clearance_force_reserved
+            + cleared_unreserved_sorted + uncleared_unreserved_sorted
+        )
         return res

@@ -1195,6 +1195,37 @@ class TestClearanceReservation(TransactionCase):
             "explicitly overridden — relocation goes through same as an ordinary reservation",
         )
 
+    def test_forecast_uncleared_order_always_sorts_below_cleared_within_unreserved(self):
+        """Found via a live queue question: within the unreserved block,
+        an uncleared (no_invoice) order must never rank above a genuinely
+        cleared (paid) order just because it's needed sooner — clearance
+        status is a more fundamental signal than delivery date once
+        you're comparing across cleared and uncleared, even though
+        NEITHER currently holds any stock. Delivery date only breaks
+        ties within each of the two groups."""
+        cleared = self._make_order(self.partner_a, 10)
+        cleared.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=60)
+
+        uncleared = self._make_admin_only_order(self.partner_b, 10)
+        uncleared.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=10)
+
+        # Neither holds any stock — both stay fully unreserved.
+        for order in (cleared, uncleared):
+            order.order_line.move_ids.invalidate_recordset()
+            self.assertNotEqual(order.order_line.move_ids.state, "assigned")
+
+        report = self.env["stock.forecasted_product_product"].with_context(warehouse=self.warehouse.id)
+        data = report._get_report_data(product_ids=[self.product.id])
+        order_ids_in_order = [
+            l["document_out"]["id"] for l in data["lines"]
+            if l.get("document_out") and l["document_out"].get("_name") == "sale.order"
+        ]
+        self.assertLess(
+            order_ids_in_order.index(cleared.id),
+            order_ids_in_order.index(uncleared.id),
+            "the cleared order must sort above the uncleared one despite its later delivery date",
+        )
+
 
 @tagged("post_install", "-at_install")
 class TestClearanceBinStock(TransactionCase):
