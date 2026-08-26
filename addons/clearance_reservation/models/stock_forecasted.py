@@ -369,6 +369,31 @@ class StockForecasted(models.AbstractModel):
                 return (0, clearance_date)
             return (99, datetime.max)
 
+        # Live bug found (S01437 vs S01533): S01533 is flagged "Scheduled
+        # Future Stock" — the real engine's own TOP priority tier
+        # (_clearance_move_priority tier 0, ranked ahead of even a fresh
+        # force-reserve, since it's reclaiming a specifically promised
+        # shipment). But this report's own sort only compared raw
+        # clearance_date within the unreserved block, so S01533's later
+        # clearance timestamp (08/14 vs S01437's 08/12) wrongly sank it
+        # BELOW an ordinary tier-2 line the real engine would never let
+        # it lose to. Pulled out into its own block, sorted by
+        # order.pick_scheduled_date — the exact same tiebreak tier 0
+        # itself uses — and placed above every other unreserved group,
+        # mirroring the real tier ordering (0 above 1 above 2).
+        scheduled_future_stock_unreserved = [
+            line for line in unreserved_lines if line.get("lock_reason") == "Scheduled Future Stock"
+        ]
+
+        def by_pick_scheduled_date(line):
+            document_out = line.get("document_out")
+            order = orders_by_id.get(document_out["id"]) if document_out else None
+            return (order.pick_scheduled_date or datetime.max) if order else datetime.max
+
+        scheduled_future_stock_unreserved.sort(key=by_pick_scheduled_date)
+        scheduled_future_stock_ids = {id(line) for line in scheduled_future_stock_unreserved}
+        unreserved_lines = [line for line in unreserved_lines if id(line) not in scheduled_future_stock_ids]
+
         # Explicit product decision: clearance timestamp is ALWAYS the
         # leading signal for who gets stock next — an order's place in
         # the queue is its place in the queue, whether or not it
@@ -446,8 +471,12 @@ class StockForecasted(models.AbstractModel):
         # demand, just excluded from the queue for being scheduled too
         # far ahead; an uncleared order has no legitimate claim on stock
         # at all regardless of scheduling, which ranks it lower still.
+        # scheduled_future_stock_unreserved sits above EVERY other
+        # unreserved group, including no_clearance_force_reserved —
+        # mirrors _clearance_move_priority's own tier ordering exactly
+        # (tier 0 above tier 1 above tier 2).
         res["lines"] = (
-            reserved_block + no_clearance_force_reserved
+            reserved_block + scheduled_future_stock_unreserved + no_clearance_force_reserved
             + cleared_unreserved_sorted + far_out_unreserved_sorted
             + uncleared_unreserved_sorted
         )

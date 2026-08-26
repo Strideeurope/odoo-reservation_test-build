@@ -1469,6 +1469,59 @@ class TestClearanceReservation(TransactionCase):
             "the far-out order must still sort above an uncleared/no_invoice order",
         )
 
+    def test_forecast_scheduled_future_stock_unreserved_sorts_above_ordinary_despite_later_clearance(self):
+        """Live question: S01533 (Scheduled Future Stock — tier 0, the
+        real engine's TOP priority, above even a fresh force-reserve) was
+        sorting BELOW S01437 (an ordinary tier-2 line) purely because its
+        clearance_date happened to be later — even though the real
+        engine would never let a tier-0 holder lose to a tier-2 line for
+        anything. The report's own sort must mirror the real tier
+        ordering (0 above 1 above 2), not raw clearance_date alone,
+        for this block."""
+        other_product = self.env["product.product"].create({
+            "name": "Sched Future Stock Sort Widget", "is_storable": True,
+        })
+        self._set_stock(10, product=other_product)
+        # Forced to an earlier clearance_date (both orders would otherwise
+        # tie at second-precision if created back to back), despite having
+        # no real claim on anything (no stock of its own, no forecast).
+        ordinary = self._make_order(self.partner_c, 10, product=other_product)
+        ordinary.with_context(clearance_internal_write=True).write({
+            "clearance_date": ordinary.clearance_date - timedelta(seconds=5),
+        })
+        self._set_stock(0, product=other_product)
+
+        self._set_stock(10)
+        holder = self._make_order(self.partner_a, 10)
+        holder_scheduled = fields.Datetime.now() + relativedelta(days=30)
+        holder.pick_scheduled_date = holder_scheduled
+        self._create_committed_po(10, holder_scheduled - timedelta(days=14))
+        self.env.invalidate_all()
+        self.assertEqual(holder.order_line.clearance_defer_reason, "Scheduled Future Stock")
+
+        early = self._make_order(self.partner_b, 10)
+        early.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=5)
+        self.env["sale.order"]._reserve_by_clearance(product_ids=[self.product.id])
+        holder.order_line.invalidate_recordset()
+        self.assertEqual(holder.order_line.move_ids.quantity, 0, "holder gave up its stock")
+        self.assertTrue(holder.order_line.is_scheduled_future_stock_release)
+        self.assertGreater(
+            holder.clearance_date, ordinary.clearance_date,
+            "holder must genuinely have the LATER clearance timestamp for this test to prove anything",
+        )
+
+        report = self.env["stock.forecasted_product_product"].with_context(warehouse=self.warehouse.id)
+        data = report._get_report_data(product_ids=[self.product.id, other_product.id])
+        order_ids_in_order = [
+            l["document_out"]["id"] for l in data["lines"]
+            if l.get("document_out") and l["document_out"].get("_name") == "sale.order"
+        ]
+        self.assertLess(
+            order_ids_in_order.index(holder.id),
+            order_ids_in_order.index(ordinary.id),
+            "the Scheduled Future Stock line must sort above the ordinary one despite its later clearance timestamp",
+        )
+
     def test_forecast_unreserved_lines_sort_by_clearance_not_delivery_date(self):
         """Explicit product decision: clearance timestamp is ALWAYS the
         leading signal for who gets stock next — an order's place in the
