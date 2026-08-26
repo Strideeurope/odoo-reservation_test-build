@@ -1,0 +1,21 @@
+<odoo>
+    <record id="view_purchase_order_form_clearance" model="ir.ui.view">
+        <field name="name">purchase.order.form.clearance</field>
+        <field name="model">purchase.order</field>
+        <field name="inherit_id" ref="purchase.purchase_order_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//div[@name='reminder']" position="after">
+                <label for="container_reference"/>
+                <div class="o_row">
+                    <field name="container_reference" placeholder="e.g. MSCU1234567"/>
+                </div>
+                <label for="port_arrival_date"/>
+                <div class="o_row">
+                    <field name="port_arrival_date"/>
+                    <field name="is_receipt_confirmed" invisible="1"/>
+                    <span class="badge text-bg-success ms-2" invisible="not is_receipt_confirmed">Confirmed</span>
+                </div>
+            </xpath>
+        </field>
+    </record>
+</odoo>

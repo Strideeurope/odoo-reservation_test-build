@@ -111,6 +111,43 @@ class StockMove(models.Model):
         res.filtered("is_locked_reservation").write({"is_locked_reservation": False})
         return res
 
+    def write(self, vals):
+        # Whatever the actual path (purchase_order.py's own
+        # _sync_confirmed_receipt_date, a native reschedule, or a direct
+        # manual edit on the receipt picking) — a committed incoming
+        # shipment's own date is exactly what
+        # _get_group_safe_future_replacement_lines' release buffer and
+        # _forecast_incoming_allocation's ordering both key off. A change
+        # here can newly qualify (or disqualify) a "Scheduled Future
+        # Stock" release, or shuffle forecast ordering, so the queue must
+        # re-run for the affected product(s) immediately rather than
+        # waiting for some unrelated later event to happen to touch the
+        # same product.
+        # Excludes a write that ALSO transitions the move to done/cancel
+        # in the same call (native _action_done touches the move's own
+        # date as part of completing it) — that transition already has
+        # its own dedicated, correctly-sequenced re-run
+        # (stock_picking.py's button_validate() override); triggering a
+        # second one here races it mid-transaction, before the picking's
+        # own quantities/state have actually settled.
+        affected_product_ids = set()
+        if (
+            "date" in vals
+            and vals.get("state") not in ("done", "cancel")
+            and not self.env.context.get("_within_reserve_by_clearance")
+        ):
+            affected_product_ids = set(
+                self.filtered(
+                    lambda m: m.purchase_line_id
+                    and m.state not in ("done", "cancel")
+                    and m.purchase_line_id.order_id.state in ("purchase", "done")
+                ).product_id.ids
+            )
+        res = super().write(vals)
+        if affected_product_ids:
+            self.env["sale.order"]._reserve_by_clearance(product_ids=list(affected_product_ids))
+        return res
+
     def _action_assign(self, force_qty=False):
         res = super()._action_assign(force_qty=force_qty)
         # Ship depends on payment status alone (see sale_order.py), so

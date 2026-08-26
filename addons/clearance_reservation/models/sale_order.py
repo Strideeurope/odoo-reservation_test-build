@@ -11,9 +11,22 @@ FAR_FUTURE_MONTHS = 6
 # earlier-scheduled competitor once its own scheduled date sits at least
 # this many days past a committed future incoming shipment that's been
 # verified to actually cover its demand (see sale_order_line.py's
-# _has_safe_future_replacement) — a real safety margin, not a hair's
-# breadth.
-SCHEDULED_FUTURE_STOCK_RELEASE_BUFFER_DAYS = 14
+# _get_group_safe_future_replacement_lines) — a real safety margin, not a
+# hair's breadth. Applies once the matched shipment's own PO is
+# genuinely confirmed (purchase_order.py's is_receipt_confirmed —
+# container reference AND port arrival date both on file): real
+# logistics data, not just a plan, justifies trusting a tighter margin.
+# The matched shipment's own move.date already reflects port arrival +
+# transit time once confirmed — see purchase_order.py's
+# _sync_confirmed_receipt_date — so this is measured against that same
+# move.date/date_planned in both the confirmed and unconfirmed case.
+SCHEDULED_FUTURE_STOCK_RELEASE_BUFFER_DAYS = 7
+# The wider margin required when the matched shipment's PO is NOT yet
+# confirmed — still just a committed order with a planned date, no
+# container/port data locking the timing down. Explicit product
+# decision: more room for a merely-planned date to slip before it's
+# trusted enough to justify giving up real, currently-held stock.
+SCHEDULED_FUTURE_STOCK_RELEASE_BUFFER_DAYS_UNCONFIRMED = 30
 # The future incoming shipment matched against a line for that safety
 # check is the one nearest to (scheduled_date + this many days) — a
 # small head start before the order actually needs the goods, so the
@@ -580,6 +593,80 @@ class SaleOrder(models.Model):
         self._reserve_by_clearance()
 
     @api.model
+    def _clearance_priority_key_for_line(self, sale_line, simulate_now=False):
+        """Ranks a sale.order.line by its own/its order's actual claim —
+        never the order-wide queue_priority_bucket. Grouped and processed
+        per product: fairness is a per-product concept, an order's turn
+        for product A must never be decided by, or affect, its standing
+        for product B.
+
+        Split out of _clearance_move_priority (which needed a real move)
+        so a line's priority can be asked about even with no move at all
+        yet — a draft/sent order's line, simulated as "if this were
+        confirmed right now" by _simulate_clearance_availability below,
+        via simulate_now=True.
+
+        Hard lock is deliberately absent from this ranking — its only job
+        is protecting whatever an order ALREADY holds (guaranteed
+        unconditionally elsewhere), not winning it any claim on stock that
+        isn't already spoken for. A hard-locked order with nothing paid or
+        force-reserved of its own competes for new stock at the very back,
+        same as any other order with no real claim.
+        """
+        order = sale_line.order_id
+        # A line that gave up its stock under "Scheduled Future Stock" (or
+        # would still qualify to) outranks EVERYTHING else, force-reserve
+        # included, for whatever arrives next on this product — force-
+        # reserve only ever takes stock that's genuinely available; it must
+        # never be able to grab the very future incoming shipment a holder
+        # gave up its current stock specifically to reclaim. Ranked by its
+        # own scheduled_date, earliest first, among each other.
+        if sale_line.clearance_defer_reason == "Scheduled Future Stock":
+            return (0, order.pick_scheduled_date or datetime.min)
+        if sale_line.is_force_reserved:
+            return (1, sale_line.force_reserved_date or datetime.min)
+        if order.clearance_date:
+            return (2, order.clearance_date)
+        # A draft/sent order has no real clearance_date yet — simulate_now
+        # treats it as "if this were confirmed right this instant", the
+        # exact tier a genuine grace-period confirmation would land in,
+        # rather than falling all the way to tier 3 (no real claim at
+        # all), which would understate what a fresh confirmation would
+        # actually be entitled to.
+        if simulate_now:
+            return (2, fields.Datetime.now())
+        return (3, datetime.min)
+
+    @api.model
+    def _clearance_move_priority(self, move):
+        """Thin move-based wrapper around _clearance_priority_key_for_line
+        — hoisted out of _reserve_by_clearance as a real method (rather
+        than a throwaway closure) so _forecast_incoming_allocation below
+        can reuse the identical tiering for the not-yet-arrived side of
+        the queue, instead of re-deriving it and risking the two drifting
+        apart."""
+        return self._clearance_priority_key_for_line(move.sale_line_id)
+
+    def _clearance_is_far_future_move(self, move, far_future_cutoff):
+        """Mirrors _reserve_by_clearance's own far-future exclusion exactly
+        — hoisted so _forecast_incoming_allocation excludes the same demand
+        from competing for FUTURE incoming that this method excludes from
+        competing for CURRENT stock, for the same reason: an order months
+        out has no more business getting first claim on an arriving PO than
+        it has on today's on-hand stock. The one exception, both places: an
+        order/line override (hard lock or force-reserve) always sticks
+        regardless of how far out the order is scheduled.
+        """
+        sale_line = move.sale_line_id
+        order = sale_line.order_id
+        return bool(
+            order.pick_scheduled_date
+            and order.pick_scheduled_date > far_future_cutoff
+            and not order.is_reservation_hard_locked
+            and not sale_line.is_reservation_hard_locked
+            and not sale_line.is_force_reserved
+        )
+
     def _reserve_by_clearance(self, product_ids=None):
         """Run the clearance queue, optionally scoped to a set of product
         (variant) ids. Scoping to specific products is safe without breaking
@@ -687,11 +774,7 @@ class SaleOrder(models.Model):
         # in this module, and this is no different.
         far_future_cutoff = fields.Datetime.now() + relativedelta(months=FAR_FUTURE_MONTHS)
         far_future_moves = all_moves.filtered(
-            lambda m: m.sale_line_id.order_id.pick_scheduled_date
-            and m.sale_line_id.order_id.pick_scheduled_date > far_future_cutoff
-            and not m.sale_line_id.order_id.is_reservation_hard_locked
-            and not m.sale_line_id.is_reservation_hard_locked
-            and not m.sale_line_id.is_force_reserved
+            lambda m: self._clearance_is_far_future_move(m, far_future_cutoff)
         )
 
         # Fast path: if every move already sits at "assigned" — whether it
@@ -713,6 +796,30 @@ class SaleOrder(models.Model):
 
         touched = all_moves | foreign_moves
         before_state = {m.id: (m.state, m.quantity) for m in touched}
+
+        # Snapshot of genuinely free (unreserved, on-hand) quantity per
+        # product, taken BEFORE this run's own blanket release below —
+        # needed later so the "Scheduled Future Stock" targeted-release
+        # pass can tell a holder that reclaimed truly NEW stock (a
+        # receipt, a cancellation, anything that freed real stock
+        # independent of this run) apart from a holder that's merely
+        # cycling through the SAME stock this run's own blanket release
+        # is about to free up moments from now. See the targeted-release
+        # block below for exactly why that distinction matters — without
+        # it, a holder that legitimately reclaims its promised shipment
+        # can have that reclaim immediately clawed back and handed to an
+        # ordinary, lower-tier competitor with no claim on it at all.
+        holder_products = touched.filtered(
+            lambda m: m.sale_line_id.clearance_defer_reason == "Scheduled Future Stock"
+        ).product_id
+        pre_release_free_qty = {}
+        for product in holder_products:
+            warehouse = touched.filtered(
+                lambda m: m.product_id == product
+            )[:1].sale_line_id.order_id.warehouse_id
+            pre_release_free_qty[product.id] = product.with_context(
+                location=warehouse.lot_stock_id.id
+            ).free_qty
 
         # Protected from RELEASE, unconditionally — force-reserved moves
         # (via is_locked_reservation, set once one is actually granted),
@@ -754,42 +861,10 @@ class SaleOrder(models.Model):
 
         all_moves = all_moves - far_future_moves
 
-        # Ranks a MOVE by its own line/order's actual claim — never the
-        # order-wide queue_priority_bucket (see the `orders` search above).
-        # Grouped and processed per product below: fairness is a
-        # per-product concept, an order's turn for product A must never be
-        # decided by, or affect, its standing for product B.
-        #
-        # Hard lock is deliberately absent from this ranking — its only
-        # job is protecting whatever an order ALREADY holds (guaranteed
-        # unconditionally elsewhere: excluded from foreign_moves above, and
-        # from _do_unreserve/_action_cancel directly), not winning it any
-        # claim on stock that isn't already spoken for. A hard-locked order
-        # with nothing paid or force-reserved of its own competes for new
-        # stock at the very back, same as any other order with no real
-        # claim — it's still attempted here (never invisible to the queue)
-        # so it can pick up genuine leftovers, just never ahead of anyone
-        # who actually has a claim.
-        def move_priority(move):
-            sale_line = move.sale_line_id
-            order = sale_line.order_id
-            # A line that gave up its stock under "Scheduled Future Stock"
-            # (or would still qualify to) outranks EVERYTHING else,
-            # force-reserve included, for whatever arrives next on this
-            # product — force-reserve only ever takes stock that's
-            # genuinely available; it must never be able to grab the very
-            # future incoming shipment a holder gave up its current stock
-            # specifically to reclaim, or the safety guarantee this whole
-            # mechanism exists for would be broken by the next override
-            # click. Ranked by its own scheduled_date, earliest first,
-            # among each other.
-            if sale_line.clearance_defer_reason == "Scheduled Future Stock":
-                return (0, order.pick_scheduled_date or datetime.min)
-            if sale_line.is_force_reserved:
-                return (1, sale_line.force_reserved_date or datetime.min)
-            if order.clearance_date:
-                return (2, order.clearance_date)
-            return (3, datetime.min)
+        # See _clearance_move_priority's own docstring for the tiering and
+        # rationale — hoisted there so _forecast_incoming_allocation can
+        # reuse the identical ranking.
+        move_priority = self._clearance_move_priority
 
         by_product = {}
         for m in all_moves:
@@ -861,8 +936,39 @@ class SaleOrder(models.Model):
                 # Release from whichever eligible holder has the most
                 # slack (latest scheduled_date) first, one at a time,
                 # only as far as actually needed to satisfy this demand.
+                #
+                # Bug found live: a holder that has ALREADY released once
+                # can be sitting here fully "assigned" for a completely
+                # different reason than "still holding old stock it
+                # could give up" — it may have just reclaimed its OWN
+                # promised shipment moments ago, in this very same run's
+                # main pass. is_scheduled_future_stock_release alone can't
+                # tell those apart (it stays True across both), and
+                # naively excluding on that flag alone breaks the
+                # holder's legitimate FIRST release too, whenever that
+                # release happens to be re-derived over two consecutive
+                # runs (e.g. an earlier competitor's own action_confirm()
+                # already triggered it once, then this method runs again
+                # explicitly) — in that case nothing new actually arrived,
+                # and giving the stock to the earlier-scheduled competitor
+                # is exactly correct.
+                #
+                # The real distinguishing signal is pre_release_free_qty,
+                # above: genuinely-free stock that existed BEFORE this
+                # run's own blanket release even ran. If that was zero,
+                # whatever this holder is now "assigned" MUST be recycled
+                # from this run's own churn (nothing else could have
+                # supplied it) — safe to take back, matching every
+                # existing single-competitor scenario. If it was
+                # positive, something real became available independent
+                # of this run's churn — a genuine reclaim, which must be
+                # protected rather than clawed back to a lower tier.
                 eligible_holders = holders.filtered(
                     lambda m: m.state in ("assigned", "partially_available")
+                    and not (
+                        m.sale_line_id.is_scheduled_future_stock_release
+                        and pre_release_free_qty.get(m.product_id.id, 0) > 0
+                    )
                     and m.sale_line_id.order_id.pick_scheduled_date
                     and m.sale_line_id.order_id.pick_scheduled_date > demand_order.pick_scheduled_date
                 ).sorted(key=lambda m: m.sale_line_id.order_id.pick_scheduled_date, reverse=True)
@@ -974,3 +1080,226 @@ class SaleOrder(models.Model):
                 target.message_post(body="Reservation queue: " + "; ".join(lines) + ".")
 
         return {"order_count": len(orders), "reserved_move_count": changed}
+
+    @api.model
+    def _forecast_incoming_allocation(self, product_ids=None):
+        """The forecast-only twin of _reserve_by_clearance, for stock that
+        hasn't arrived yet: a live, never-persisted allocation of every
+        committed future incoming PO shipment against every currently-open
+        outgoing demand move, ranked in the EXACT same clearance-priority
+        order real reservation uses (_clearance_move_priority) — so the
+        forecast can never promise an outcome the real engine wouldn't
+        actually produce once a shipment lands.
+
+        Never calls _action_assign()/_do_unreserve() and never writes
+        anything: pure computation over currently-committed state,
+        re-derived from scratch on every call, same as bin_stock_total.
+
+        Returns {move_id: [{"qty", "expected_date", "incoming_move_id",
+        "purchase_order_id", "purchase_order_name",
+        "purchase_order_confirmed"}, ...]} for every open
+        demand move considered. An empty list means even ALL committed
+        incoming for that product/warehouse won't help this move right
+        now; a non-empty list may still sum to less than the move's own
+        remaining demand (partial coverage) — see sale_order_line.py's
+        expected_incoming_fully_covers_remaining.
+        """
+        move_domain = [
+            ("state", "not in", ("done", "cancel", "assigned")),
+            ("sale_line_id", "!=", False),
+            "|",
+            ("sale_line_id.order_id.fulfillment_stage", "in", ("order_pick", "ship", "grace_period")),
+            ("sale_line_id.is_force_reserved", "=", True),
+        ]
+        if product_ids:
+            move_domain.append(("product_id", "in", product_ids))
+        demand_moves = self.env["stock.move"].search(move_domain)
+        if not demand_moves:
+            return {}
+
+        # Only the leg that actually draws from warehouse stock competes
+        # for a future incoming shipment landing in that same stock. A
+        # multi-step route's downstream leg (Ship, Pack) is chained
+        # ('waiting') behind the Pick leg for the SAME underlying customer
+        # demand — counting it too would double-book the same units
+        # against the incoming pool. _reserve_by_clearance never hits this
+        # because _action_assign() on a still-waiting Ship move is a
+        # harmless no-op; this method does real bucket arithmetic, so it
+        # must filter explicitly.
+        demand_moves = demand_moves.filtered(
+            lambda m: m.picking_type_id == m.sale_line_id.order_id.warehouse_id.pick_type_id
+        )
+        if not demand_moves:
+            return {}
+
+        far_future_cutoff = fields.Datetime.now() + relativedelta(months=FAR_FUTURE_MONTHS)
+        demand_moves = demand_moves.filtered(
+            lambda m: not self._clearance_is_far_future_move(m, far_future_cutoff)
+        )
+
+        by_product_wh = {}
+        for m in demand_moves:
+            wh = m.sale_line_id.order_id.warehouse_id
+            key = (m.product_id.id, wh.id)
+            by_product_wh.setdefault(key, self.env["stock.move"])
+            by_product_wh[key] |= m
+
+        result = {}
+        for (product_id, wh_id), moves in by_product_wh.items():
+            product = self.env["product.product"].browse(product_id)
+            warehouse = self.env["stock.warehouse"].browse(wh_id)
+            incoming = self.env["sale.order.line"]._get_committed_future_incoming_moves_for_product(
+                product, warehouse
+            )
+            if not incoming:
+                for m in moves:
+                    result[m.id] = []
+                continue
+
+            # Already date-ascending (see _get_committed_future_incoming_moves_for_product).
+            buckets = [{"move": im, "remaining": im.product_qty} for im in incoming]
+
+            for move in moves.sorted(key=self._clearance_move_priority):
+                need = move.product_qty - move.quantity
+                allocations = []
+                for bucket in buckets:
+                    if need <= 0:
+                        break
+                    take = min(need, bucket["remaining"])
+                    if take <= 0:
+                        continue
+                    po = bucket["move"].purchase_line_id.order_id
+                    allocations.append({
+                        "qty": take,
+                        "expected_date": bucket["move"].date,
+                        "incoming_move_id": bucket["move"].id,
+                        "purchase_order_id": po.id,
+                        "purchase_order_name": po.name,
+                        # True once the PO's container reference AND port
+                        # arrival date are both on file (see
+                        # purchase_order.py) — the receive date is then
+                        # treated as confirmed, not just planned.
+                        "purchase_order_confirmed": po.is_receipt_confirmed,
+                    })
+                    bucket["remaining"] -= take
+                    need -= take
+                result[move.id] = allocations
+        return result
+
+    @api.model
+    def _simulate_clearance_availability(self, lines):
+        """The draft-order twin of _forecast_incoming_allocation /
+        _reserve_by_clearance, for a sale.order.line that has no
+        stock.move at all yet (order still draft/sent — nothing to
+        assign, nothing to search for by sale_line_id). Answers: if this
+        order were confirmed right now, how much of this line's own
+        demand would it actually get, and by when — inserted into the
+        REAL queue at its real priority (as-if-confirmed-now for a line
+        with no clearance_date yet, via
+        _clearance_priority_key_for_line's simulate_now=True), ahead of
+        or behind every genuinely competing REAL open demand for the
+        same product/warehouse. Never assigns/writes anything: pure
+        computation, re-derived from scratch on every call.
+
+        Two supply phases, walked together in priority order:
+
+          1. On-hand free_qty at the warehouse's own Stock location —
+             already nets out every CURRENT reservation, so no need to
+             re-simulate existing holders individually.
+          2. Future committed incoming (same buckets
+             _forecast_incoming_allocation itself builds).
+
+        Every REAL claim ranked ahead of a given hypothetical line takes
+        its own share of on-hand first, then future buckets in date
+        order, before the hypothetical gets anything — the exact
+        allocation order the real engine would use once confirmed.
+
+        Returns {line_id: {"qty_now", "chunks": [{"qty",
+        "expected_date", "purchase_order_id", "purchase_order_name",
+        "purchase_order_confirmed"}], "total_qty"}}.
+        """
+        lines = lines.filtered(lambda l: l.product_id and l.product_uom_qty and l.order_id.warehouse_id)
+        if not lines:
+            return {}
+
+        by_product_wh = {}
+        for line in lines:
+            key = (line.product_id.id, line.order_id.warehouse_id.id)
+            by_product_wh.setdefault(key, self.env["sale.order.line"])
+            by_product_wh[key] |= line
+
+        far_future_cutoff = fields.Datetime.now() + relativedelta(months=FAR_FUTURE_MONTHS)
+        # Same domain _forecast_incoming_allocation uses for genuinely
+        # open (not yet holding anything) real demand — this simulation
+        # only needs to know what's AHEAD of the hypothetical in the
+        # queue; anything already assigned has already taken its share
+        # out of free_qty, which on-hand below already reflects.
+        move_domain_base = [
+            ("state", "not in", ("done", "cancel", "assigned")),
+            ("sale_line_id", "!=", False),
+            "|",
+            ("sale_line_id.order_id.fulfillment_stage", "in", ("order_pick", "ship", "grace_period")),
+            ("sale_line_id.is_force_reserved", "=", True),
+        ]
+
+        result = {}
+        for (product_id, wh_id), hypo_lines in by_product_wh.items():
+            product = self.env["product.product"].browse(product_id)
+            warehouse = self.env["stock.warehouse"].browse(wh_id)
+
+            real_moves = self.env["stock.move"].search(
+                move_domain_base + [("product_id", "=", product_id)]
+            ).filtered(
+                lambda m: m.sale_line_id.order_id.warehouse_id == warehouse
+                and m.picking_type_id == warehouse.pick_type_id
+                and not self._clearance_is_far_future_move(m, far_future_cutoff)
+            )
+
+            on_hand_remaining = product.with_context(location=warehouse.lot_stock_id.id).free_qty
+            incoming = self.env["sale.order.line"]._get_committed_future_incoming_moves_for_product(
+                product, warehouse
+            )
+            buckets = [{"move": im, "remaining": im.product_qty} for im in incoming]
+
+            claims = [
+                {"key": self._clearance_move_priority(m), "need": m.product_qty - m.quantity, "hypo_line_id": None}
+                for m in real_moves
+            ] + [
+                {
+                    "key": self._clearance_priority_key_for_line(line, simulate_now=True),
+                    "need": line.product_uom_qty,
+                    "hypo_line_id": line.id,
+                }
+                for line in hypo_lines
+            ]
+            claims.sort(key=lambda c: c["key"])
+
+            for claim in claims:
+                need = claim["need"]
+                qty_now = min(need, on_hand_remaining)
+                on_hand_remaining -= qty_now
+                need -= qty_now
+                chunks = []
+                for bucket in buckets:
+                    if need <= 0:
+                        break
+                    take = min(need, bucket["remaining"])
+                    if take <= 0:
+                        continue
+                    po = bucket["move"].purchase_line_id.order_id
+                    chunks.append({
+                        "qty": take,
+                        "expected_date": bucket["move"].date,
+                        "purchase_order_id": po.id,
+                        "purchase_order_name": po.name,
+                        "purchase_order_confirmed": po.is_receipt_confirmed,
+                    })
+                    bucket["remaining"] -= take
+                    need -= take
+                if claim["hypo_line_id"] is not None:
+                    result[claim["hypo_line_id"]] = {
+                        "qty_now": qty_now,
+                        "chunks": chunks,
+                        "total_qty": qty_now + sum(c["qty"] for c in chunks),
+                    }
+        return result

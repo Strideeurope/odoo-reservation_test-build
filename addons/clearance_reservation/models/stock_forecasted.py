@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from odoo import models
-from odoo.tools import format_datetime
+from odoo.tools import format_date, format_datetime
 
 
 class StockForecasted(models.AbstractModel):
@@ -52,6 +52,85 @@ class StockForecasted(models.AbstractModel):
             # drift between the two surfaces.
             document_out["fulfillment_stage"] = order.fulfillment_stage
             document_out["fulfillment_stage_label"] = order.fulfillment_stage_label
+
+        # Forecast twin of the lock_reason block below, but for stock that
+        # hasn't arrived yet: native ins-matching (what decides
+        # replenishment_filled/the native Reserve link for an unreserved
+        # line) runs its own FCFS-ish ordering, blind to clearance
+        # priority — and for this warehouse's layout, native "taken from
+        # current stock"/"transit" reconciliation is dead code (see
+        # _get_report_data below), so native ins-matching is the ONLY
+        # thing left deciding whether an unreserved line looks
+        # "coverable" at all. Attach our own, clearance-priority-correct
+        # answer here so the JS can show it instead, and flag when native
+        # would otherwise show a Reserve link that's actually driven by
+        # that priority-blind matching rather than this module's queue.
+        if move_out and not line.get("reservation"):
+            sale_line = move_out.sale_line_id
+            has_forecast = bool(sale_line and sale_line.expected_incoming_qty)
+            is_late = (
+                has_forecast and move_out.date and sale_line.expected_incoming_date
+                and sale_line.expected_incoming_date > move_out.date
+            )
+            if has_forecast:
+                breakdown = sale_line.expected_incoming_breakdown
+                # The same entry expected_incoming_source/_date are
+                # already drawn from (the latest-needed shipment) — its
+                # id is what a clickable PO link needs. A split line
+                # drawing from more than one PO can still only carry ONE
+                # link here, same limitation native's own document_in
+                # has (one move_in, one link, per report row).
+                primary_po_id = breakdown[-1]["purchase_order_id"] if breakdown else False
+                # True once that PO's container reference AND port
+                # arrival date are both on file (purchase_order.py) — the
+                # receive date is then treated as confirmed, not just
+                # planned. Only the primary (latest-needed) shipment's
+                # status is shown here, same one-PO-per-row limit as the
+                # link itself.
+                primary_confirmed = breakdown[-1]["purchase_order_confirmed"] if breakdown else False
+                line["clearance_incoming_forecast"] = {
+                    "qty": sale_line.expected_incoming_qty,
+                    # Native's own Receipt column shows a date, not a
+                    # datetime (format_date, not format_datetime) —
+                    # matched here so a receipt date reads identically
+                    # regardless of whether it came from native's own
+                    # match or ours.
+                    "date": format_date(self.env, sale_line.expected_incoming_date),
+                    "source": sale_line.expected_incoming_source,
+                    "purchase_order_id": primary_po_id,
+                    "confirmed": primary_confirmed,
+                    "fully_covers_remaining": sale_line.expected_incoming_fully_covers_remaining,
+                    "is_late": is_late,
+                }
+            else:
+                line["clearance_incoming_forecast"] = False
+            # Native's own receipt_date/is_late (Receipt column) and
+            # replenishment_filled (Used-by/Delivery columns' red
+            # background) are ALL derived from the exact same priority-
+            # blind ins-match this module distrusts (see _get_report_data
+            # below for why "taken from stock"/"transit" reconciliation
+            # is dead code on this warehouse's layout — ins-matching is
+            # the only thing native has left to decide any of this for an
+            # order-demand line). Replaced here with our own answer for
+            # the receipt date (or none, if nothing is genuinely coming).
+            # Explicit product decision: red is reserved for a line with
+            # NEITHER real reserved quants NOR a committed future PO
+            # against it — a real reservation is handled elsewhere
+            # (line.reservation, already excluded from this whole block),
+            # and a genuine forecast (however tight the timing) counts
+            # as "covered" for colour purposes, white like a reservation
+            # — "is_late" stays purely informational (the forecast
+            # badge's tooltip), never a reason to flag red on its own.
+            line["clearance_receipt_date"] = (
+                format_date(self.env, sale_line.expected_incoming_date) if has_forecast else False
+            )
+            line["clearance_is_late_or_unavailable"] = not has_forecast
+            # move_in being set on THIS call is exactly native's
+            # ins-matching path (_reconcile_out_with_ins). Kept alongside
+            # the two fields above (rather than relied on by itself) so
+            # the JS can still tell, if it ever needs to, whether native
+            # additionally rendered a (now-overridden) match of its own.
+            line["clearance_reserve_is_misleading"] = bool(move_in)
 
         # move_out here is the actual demand move (the "out" that
         # _get_report_lines is building this line for), not the possibly-
@@ -171,6 +250,42 @@ class StockForecasted(models.AbstractModel):
             if not _is_from_output(line) and not _is_phantom_transit(line)
         ]
 
+        # Native's own per-move ins/outs reconciliation can fragment ONE
+        # move's still-open remaining demand into several separate report
+        # rows — e.g. an 8-unit row it (misleadingly) considers "filled"
+        # against a specific incoming move, plus a separate 21-unit row
+        # for the rest — when in reality both pieces are the exact same
+        # 29-unit remaining need from the exact same PO
+        # (clearance_incoming_forecast is already identical across every
+        # piece of the same move, since it's derived from the same
+        # sale_line). Merged back into one row here, before any of the
+        # sort/split logic below (which assumes at most one unreserved
+        # row per move_out) — fragmenting a single real demand into
+        # several rows is the same class of misleading native behavior
+        # this module already corrects elsewhere, just at the row-count
+        # level instead of the link/colour level. Never touches reserved
+        # rows (a genuinely reserved move's own split-remainder handling
+        # is separate, see further below) or lines with no move_out at
+        # all (e.g. a bare Free Stock line).
+        merged_by_move_id = {}
+        merged_lines = []
+        for line in lines:
+            move_out = line.get("move_out")
+            move_id = move_out.get("id") if move_out else None
+            if line.get("reservation") or move_id is None:
+                merged_lines.append(line)
+                continue
+            existing = merged_by_move_id.get(move_id)
+            if existing is None:
+                merged_by_move_id[move_id] = line
+                merged_lines.append(line)
+            else:
+                existing["quantity"] = existing.get("quantity", 0) + line.get("quantity", 0)
+                existing["clearance_reserve_is_misleading"] = bool(
+                    existing.get("clearance_reserve_is_misleading") or line.get("clearance_reserve_is_misleading")
+                )
+        lines = merged_lines
+
         order_ids = {
             line["document_out"]["id"]
             for line in lines
@@ -192,6 +307,11 @@ class StockForecasted(models.AbstractModel):
             move_out = line.get("move_out")
             return move_out.get("date") if move_out else None
 
+        # Python's sort is stable, so ties (including "no delivery date at
+        # all") keep their original relative order.
+        def by_delivery_date(line):
+            return (0, line_delivery_date(line)) if line_delivery_date(line) else (1, "")
+
         # Explicit product decision: a line that currently holds no
         # reservation at all is ALWAYS sorted below every line that does,
         # full stop — clearance priority only means something once stock
@@ -199,10 +319,43 @@ class StockForecasted(models.AbstractModel):
         # a fulfilled one by clearance_date alone (which used to happen —
         # e.g. a far-future order excluded from reservation but with an
         # early clearance_date) was misleading. Reserved and unreserved
-        # are therefore sorted as two fully separate blocks, never
-        # interleaved by comparing across them.
+        # are therefore sorted as two separate blocks — except a split
+        # line's own still-unfulfilled remainder (see the sibling
+        # extraction below), which stays pinned directly beneath its own
+        # reserved portion instead of sorting into the unreserved block
+        # like an unrelated line.
         reserved_lines = [line for line in lines if line.get("reservation")]
         unreserved_lines = [line for line in lines if not line.get("reservation")]
+
+        # Explicit product decision: once stock is actually in hand,
+        # clearance priority has already done its job — it decided WHO
+        # holds it. From here on, WHEN it's needed is what matters, so the
+        # reserved block sorts by delivery date, not clearance date.
+        reserved_sorted = sorted(reserved_lines, key=by_delivery_date)
+
+        # A partially-fulfilled "Scheduled Future Stock" line (or any
+        # other reserved-but-not-fully-covered move) produces a SECOND
+        # report line for the exact same underlying move — the reserved
+        # chunk here, and its still-unfulfilled remainder over in
+        # unreserved_lines. Pulled out here and reunited with their
+        # reserved counterpart below, rather than left to sort into the
+        # unreserved block on their own — an incomplete line belongs
+        # directly beneath its own complete portion, not scattered
+        # wherever the unreserved block's own ordering would otherwise
+        # put it.
+        reserved_move_out_ids = {
+            line["move_out"]["id"] for line in reserved_lines if line.get("move_out")
+        }
+        split_siblings_by_move_id = {}
+        rest_after_siblings = []
+        for line in unreserved_lines:
+            move_out = line.get("move_out")
+            move_id = move_out.get("id") if move_out else None
+            if move_id is not None and move_id in reserved_move_out_ids:
+                split_siblings_by_move_id.setdefault(move_id, []).append(line)
+            else:
+                rest_after_siblings.append(line)
+        unreserved_lines = rest_after_siblings
 
         # Driven by THIS line's own lock_reason/lock_date/clearance (see
         # _prepare_report_line) rather than the order-wide
@@ -210,27 +363,24 @@ class StockForecasted(models.AbstractModel):
         # can be "contaminated" by a completely unrelated line on the same
         # order (e.g. force-reserved for a different product), which would
         # wrongly promote a line that itself has no override at all.
-        #
-        # Neither hard lock nor force-reserve get their own jump-the-line
-        # tier here — a locked or force-reserved line with a genuine
-        # clearance_date of its own sorts by that, exactly like an ordinary
-        # line ("keeps its place in line"), mirroring the engine's own
-        # ranking where an override grants no priority over anyone with a
-        # real, earlier claim. Only meaningful within the reserved block —
-        # every line here already has stock, this just orders WHEN it was
-        # (or would have been) their fair turn.
         def clearance_sort_key(line):
             clearance_date = line_clearance_date(line)
             if clearance_date:
                 return (0, clearance_date)
             return (99, datetime.max)
 
-        reserved_sorted = sorted(reserved_lines, key=clearance_sort_key)
-
-        # Within the UNRESERVED block, clearance priority isn't actionable
-        # information yet — nothing has happened. What IS useful is which
-        # one is needed soonest, so this block sorts by delivery date
-        # instead (same field as the client-side "Delivery Date" toggle).
+        # Explicit product decision: clearance timestamp is ALWAYS the
+        # leading signal for who gets stock next — an order's place in
+        # the queue is its place in the queue, whether or not it
+        # currently holds anything yet. The unreserved block sorts by
+        # the exact same clearance_sort_key as the reserved block above,
+        # so the default view always mirrors the real allocation order
+        # the engine will actually use (matching the client-side
+        # "Clearance" sort toggle's own comment, which already assumed
+        # this was the server's default). Delivery date remains
+        # available as a genuinely different, informational view via the
+        # "Delivery Date" toggle — needed-soonest is a useful question,
+        # just never the one that decides who actually gets the stock.
         # The one exception: a force-reserved line with no clearance_date
         # at all (a no_invoice order, force-reserved only) still holds a
         # genuine, active claim on whatever stock arrives NEXT — the
@@ -246,28 +396,59 @@ class StockForecasted(models.AbstractModel):
 
         rest_unreserved = [line for line in unreserved_lines if id(line) not in no_clearance_ids]
 
+        # "Scheduled Far Out" (sale_order.py's own FAR_FUTURE_MONTHS
+        # exclusion) means this line has NO real claim on anything right
+        # now, or for months to come, even though the order itself was
+        # genuinely cleared (this defer reason never applies to a
+        # no_invoice/uncleared order — _compute_clearance_defer_reason
+        # already excludes those first). Sorting it in among ordinary
+        # cleared lines by raw clearance_date alone (as used to happen)
+        # could rank a far-future order ABOVE a nearer-term one it can
+        # never actually compete with for stock — pulled out here into
+        # its own block instead, placed below every genuinely competing
+        # cleared line but still above uncleared/no_invoice orders
+        # (explicit product decision: being cleared, however excluded
+        # right now, still outranks never having had a real claim at
+        # all) — see where this block lands in the final res["lines"]
+        # assembly below.
+        far_out_unreserved = [line for line in rest_unreserved if line.get("lock_reason") == "Scheduled Far Out"]
+        far_out_ids = {id(line) for line in far_out_unreserved}
+        rest_unreserved = [line for line in rest_unreserved if id(line) not in far_out_ids]
+
         # Within THIS remaining group, a genuinely cleared (paid) order
         # must still rank above one that was never even cleared — being
-        # unreserved doesn't erase that difference. Without this, an
-        # uncleared no_invoice order with an early delivery date could
-        # sort ahead of a paid, cleared order that's simply waiting on
-        # more stock — clearance status is a more fundamental signal
-        # than "needed soonest" once you're comparing across cleared and
-        # uncleared, even though NEITHER currently holds anything.
-        # Delivery date only breaks ties WITHIN each of the two groups.
+        # unreserved doesn't erase that difference. An uncleared order
+        # has no clearance timestamp at all, so there's no queue position
+        # to sort it by; it falls back to delivery date purely as an
+        # informational tiebreaker among itself, well below every
+        # cleared line regardless.
         cleared_unreserved = [line for line in rest_unreserved if line_clearance_date(line) is not None]
         uncleared_unreserved = [line for line in rest_unreserved if line_clearance_date(line) is None]
 
-        # Python's sort is stable, so ties (including "no delivery date at
-        # all") keep their original relative order.
-        def by_delivery_date(line):
-            return (0, line_delivery_date(line)) if line_delivery_date(line) else (1, "")
-
-        cleared_unreserved_sorted = sorted(cleared_unreserved, key=by_delivery_date)
+        cleared_unreserved_sorted = sorted(cleared_unreserved, key=clearance_sort_key)
         uncleared_unreserved_sorted = sorted(uncleared_unreserved, key=by_delivery_date)
+        far_out_unreserved_sorted = sorted(far_out_unreserved, key=clearance_sort_key)
 
+        # Reunite each reserved line with its own split-remainder
+        # sibling(s), if any, placed directly beneath it — everything
+        # else follows in the usual block order.
+        reserved_block = []
+        for line in reserved_sorted:
+            reserved_block.append(line)
+            move_out = line.get("move_out")
+            move_id = move_out.get("id") if move_out else None
+            reserved_block.extend(split_siblings_by_move_id.get(move_id, []))
+
+        # far_out_unreserved sits below every genuinely competing line
+        # (cleared or not) but still ABOVE uncleared/unpaid orders —
+        # explicit product decision: a far-out order was at least
+        # genuinely cleared (or is otherwise real, non-no_invoice)
+        # demand, just excluded from the queue for being scheduled too
+        # far ahead; an uncleared order has no legitimate claim on stock
+        # at all regardless of scheduling, which ranks it lower still.
         res["lines"] = (
-            reserved_sorted + no_clearance_force_reserved
-            + cleared_unreserved_sorted + uncleared_unreserved_sorted
+            reserved_block + no_clearance_force_reserved
+            + cleared_unreserved_sorted + far_out_unreserved_sorted
+            + uncleared_unreserved_sorted
         )
         return res

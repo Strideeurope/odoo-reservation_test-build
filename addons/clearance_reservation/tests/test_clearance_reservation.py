@@ -9,6 +9,7 @@ from odoo.tests import tagged
 from odoo.tests.common import TransactionCase
 
 from odoo.addons.clearance_reservation.models.sale_order import GRACE_PERIOD_DAYS
+from odoo.addons.clearance_reservation.models.purchase_order import GOODS_TRANSIT_DAYS
 
 
 @tagged("post_install", "-at_install")
@@ -153,7 +154,29 @@ class TestClearanceReservation(TransactionCase):
         })
         return order
 
-    def _create_committed_po(self, qty, date_planned, product=None):
+    def _create_committed_po(self, qty, date_planned, product=None, confirmed=True):
+        """confirmed=True (the default) means container_reference AND
+        port_arrival_date are both filled in — is_receipt_confirmed, and
+        so the tighter SCHEDULED_FUTURE_STOCK_RELEASE_BUFFER_DAYS margin.
+        Every existing caller of this helper predates the confirmed/
+        unconfirmed distinction and was written assuming the standard,
+        reliable margin — defaulting to True here keeps every one of
+        them meaning exactly what it always meant, rather than silently
+        becoming an "unconfirmed" PO (SCHEDULED_FUTURE_STOCK_RELEASE_BUFFER_DAYS_UNCONFIRMED,
+        a wider margin) the moment that distinction was introduced. Pass
+        confirmed=False explicitly for a test that specifically wants an
+        unconfirmed PO.
+
+        port_arrival_date is deliberately back-solved from the requested
+        date_planned (rather than always "today") — confirming a PO
+        re-syncs date_planned/move.date to port_arrival_date +
+        GOODS_TRANSIT_DAYS (see purchase_order.py's
+        _sync_confirmed_receipt_date), so a caller's own date_planned
+        would otherwise be silently overwritten to "today + transit
+        time" the moment confirmed=True writes port_arrival_date, no
+        matter what date_planned was asked for. Back-solving preserves
+        every existing caller's actual intent (a shipment landing at
+        exactly the requested date_planned) once confirmed."""
         product = product or self.product
         po = self.env["purchase.order"].create({
             "partner_id": self.partner_b.id,
@@ -167,6 +190,12 @@ class TestClearanceReservation(TransactionCase):
             })],
         })
         po.button_confirm()
+        if confirmed:
+            po.write({
+                "container_reference": "MSCU0000000",
+                "port_arrival_date": fields.Datetime.to_datetime(date_planned).date()
+                - timedelta(days=GOODS_TRANSIT_DAYS),
+            })
         return po
 
     def _pay_order(self, order):
@@ -863,12 +892,47 @@ class TestClearanceReservation(TransactionCase):
         scheduled = fields.Datetime.now() + relativedelta(days=30)
         order.pick_scheduled_date = scheduled
 
-        # Only 5 days of buffer — short of the required 14.
+        # Only 5 days of buffer — short of the required 7.
         self._create_committed_po(10, scheduled - timedelta(days=5))
         self.env.invalidate_all()
         self.assertFalse(
             order.order_line.clearance_defer_reason,
             "an incoming shipment cutting it too close must not count as a safe replacement",
+        )
+
+    def test_scheduled_future_stock_unconfirmed_po_requires_wider_buffer(self):
+        """Explicit product decision: an UNCONFIRMED PO (no container
+        reference / port arrival date on file — still just a planned
+        date, not verified logistics data) needs
+        SCHEDULED_FUTURE_STOCK_RELEASE_BUFFER_DAYS_UNCONFIRMED (30 days)
+        of margin, not the tighter 7 days a confirmed shipment gets."""
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        scheduled = fields.Datetime.now() + relativedelta(days=60)
+        order.pick_scheduled_date = scheduled
+
+        # 20 days of buffer: comfortably clears the confirmed 7-day
+        # margin, but falls short of the unconfirmed 30-day one.
+        self._create_committed_po(10, scheduled - timedelta(days=20), confirmed=False)
+        self.env.invalidate_all()
+        self.assertFalse(
+            order.order_line.clearance_defer_reason,
+            "20 days isn't enough margin for an unconfirmed PO's still-merely-planned date",
+        )
+
+        # The exact same 20-day timing, but now confirmed, is enough —
+        # port_arrival_date back-solved (same reasoning as
+        # _create_committed_po) so confirming doesn't silently resync
+        # date_planned/move.date to something else entirely.
+        po = self.env["purchase.order"].search([("order_line.product_id", "=", self.product.id)])
+        po.write({
+            "container_reference": "MSCU7654321",
+            "port_arrival_date": (scheduled - timedelta(days=20)).date() - timedelta(days=GOODS_TRANSIT_DAYS),
+        })
+        self.env.invalidate_all()
+        self.assertEqual(
+            order.order_line.clearance_defer_reason, "Scheduled Future Stock",
+            "the same 20-day margin is enough once the shipment is confirmed",
         )
 
     def test_scheduled_future_stock_releases_to_earlier_scheduled_order_and_reclaims_ahead_of_force_reserve(self):
@@ -1048,6 +1112,131 @@ class TestClearanceReservation(TransactionCase):
         self.assertEqual(order.order_line.move_ids.quantity, 0, "the ineligible order must give up its stock")
         self.assertEqual(competitor.order_line.move_ids.quantity, 10, "a genuinely eligible order reclaims it")
 
+    def test_scheduled_future_stock_never_overcommits_a_shared_shipment(self):
+        """Bug found live: two lines can each individually pass
+        _has_safe_future_replacement's per-line arithmetic against the
+        exact SAME committed incoming shipment, since neither check knows
+        about the other — both get tagged "Scheduled Future Stock", both
+        give up their real stock to different earlier competitors, and
+        when the shipment actually arrives (enough for only one of them)
+        the other is left holding nothing, having released on a promise
+        that was never really there for both. The safety check must be a
+        GROUP decision per product: only as many lines as the shared pool
+        can actually cover, in priority order, may ever be tagged."""
+        self._set_stock(20)
+        order_a = self._make_order(self.partner_a, 10)
+        order_b = self._make_order(self.partner_b, 10)
+        scheduled = fields.Datetime.now() + relativedelta(days=60)
+        order_a.pick_scheduled_date = scheduled
+        order_b.pick_scheduled_date = scheduled
+        order_a.order_line.invalidate_recordset()
+        order_b.order_line.invalidate_recordset()
+        self.assertEqual(order_a.order_line.move_ids.quantity, 10)
+        self.assertEqual(order_b.order_line.move_ids.quantity, 10)
+
+        # A single committed PO comfortably covers EITHER order
+        # individually — but not both at once.
+        self._create_committed_po(10, scheduled - timedelta(days=20))
+        self.env.invalidate_all()
+
+        tagged = [
+            line for line in (order_a.order_line, order_b.order_line)
+            if line.clearance_defer_reason == "Scheduled Future Stock"
+        ]
+        self.assertEqual(
+            len(tagged), 1,
+            "only one of the two lines may be told it's safe to release — the "
+            "shared 10-unit shipment can never cover both",
+        )
+
+        untagged = order_b.order_line if tagged[0] == order_a.order_line else order_a.order_line
+        self.assertFalse(untagged.clearance_defer_reason)
+        self.assertEqual(
+            untagged.move_ids.filtered(lambda m: m.state not in ("done", "cancel")).quantity, 10,
+            "the line NOT covered by the shared pool must keep holding its own real stock",
+        )
+
+    def test_scheduled_future_stock_group_check_covers_as_many_as_the_pool_allows(self):
+        """Three equally-far-scheduled lines each independently believe a
+        shared incoming pool covers their own 10-unit demand, but the
+        pool only actually has 20 units — enough for two of them, not all
+        three. Exactly two must be tagged, and the third must be left
+        holding its own real stock, untagged."""
+        self._set_stock(30)
+        order_a = self._make_order(self.partner_a, 10)
+        order_b = self._make_order(self.partner_b, 10)
+        order_c = self._make_order(self.partner_c, 10)
+        scheduled = fields.Datetime.now() + relativedelta(days=60)
+        for order in (order_a, order_b, order_c):
+            order.pick_scheduled_date = scheduled
+            order.order_line.invalidate_recordset()
+            self.assertEqual(order.order_line.move_ids.quantity, 10)
+
+        self._create_committed_po(20, scheduled - timedelta(days=20))
+        self.env.invalidate_all()
+
+        all_lines = [order_a.order_line, order_b.order_line, order_c.order_line]
+        tagged = [l for l in all_lines if l.clearance_defer_reason == "Scheduled Future Stock"]
+        untagged = [l for l in all_lines if not l.clearance_defer_reason]
+        self.assertEqual(len(tagged), 2, "a 20-unit pool can cover exactly two of the three 10-unit demands")
+        self.assertEqual(len(untagged), 1)
+        self.assertEqual(
+            untagged[0].move_ids.filtered(lambda m: m.state not in ("done", "cancel")).quantity, 10,
+            "the one line the pool can't cover must keep holding its own real stock",
+        )
+
+    def test_scheduled_future_stock_reclaim_not_stolen_by_ordinary_competitor(self):
+        """Bug found live: once a released holder actually reclaims its
+        promised shipment (the main allocation pass correctly gives it
+        priority, tier 0), the SEPARATE targeted-release pass that runs
+        right after must not treat that freshly-reclaimed stock as if it
+        were just more of the holder's old, unclaimed current stock —
+        otherwise it hands the holder's own just-won entitlement to a
+        lower-tier (ordinary) competitor that has no claim on this
+        shipment at all, leaving the tier-0 holder with nothing despite
+        having legitimately won it moments earlier in the same run."""
+        self._set_stock(10)
+        holder = self._make_order(self.partner_a, 10)
+        holder_scheduled = fields.Datetime.now() + relativedelta(days=60)
+        holder.pick_scheduled_date = holder_scheduled
+        holder.order_line.invalidate_recordset()
+        self.assertEqual(holder.order_line.move_ids.quantity, 10)
+
+        po = self._create_committed_po(10, holder_scheduled - timedelta(days=20))
+        self.env.invalidate_all()
+        self.assertEqual(holder.order_line.clearance_defer_reason, "Scheduled Future Stock")
+
+        # Earlier-scheduled competitor triggers holder's FIRST release —
+        # same mechanism as the existing reclaim test.
+        early = self._make_order(self.partner_b, 10)
+        early.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=5)
+        self.env["sale.order"]._reserve_by_clearance(product_ids=[self.product.id])
+        holder.order_line.invalidate_recordset()
+        early.order_line.invalidate_recordset()
+        self.assertEqual(holder.order_line.move_ids.quantity, 0, "holder gave up its stock")
+        self.assertEqual(early.order_line.move_ids.quantity, 10)
+        early.order_line.write({"is_reservation_hard_locked": True})
+
+        # A plain ORDINARY competitor (not force-reserved, not hard-locked
+        # — just a normal, later-arriving order) is still genuinely
+        # unfulfilled when the promised shipment actually lands.
+        late_ordinary = self._make_order(self.partner_c, 10)
+
+        po.picking_ids.button_validate()
+        holder.order_line.invalidate_recordset()
+        late_ordinary.order_line.invalidate_recordset()
+
+        self.assertEqual(
+            holder.order_line.move_ids.filtered(lambda m: m.state not in ("done", "cancel")).quantity, 10,
+            "the holder must reclaim the shipment it was promised — the main pass already "
+            "correctly gave it priority; the targeted-release pass must not undo that",
+        )
+        self.assertEqual(
+            late_ordinary.order_line.move_ids.quantity, 0,
+            "an ordinary competitor with no claim on this shipment must not receive the "
+            "holder's just-reclaimed stock",
+        )
+
     def test_scheduled_future_stock_badge_hidden_when_fully_held(self):
         """Found via a live-data question: a line fully holding its
         demand still showed the "Scheduled Future Stock" badge just
@@ -1201,8 +1390,11 @@ class TestClearanceReservation(TransactionCase):
         cleared (paid) order just because it's needed sooner — clearance
         status is a more fundamental signal than delivery date once
         you're comparing across cleared and uncleared, even though
-        NEITHER currently holds any stock. Delivery date only breaks
-        ties within each of the two groups."""
+        NEITHER currently holds any stock. An uncleared order has no
+        clearance timestamp to sort by at all, so it falls back to
+        delivery date purely as its own internal tiebreaker — see
+        test_forecast_unreserved_lines_sort_by_clearance_not_delivery_date
+        for the cleared side, which sorts by clearance timestamp instead."""
         cleared = self._make_order(self.partner_a, 10)
         cleared.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=60)
 
@@ -1225,6 +1417,628 @@ class TestClearanceReservation(TransactionCase):
             order_ids_in_order.index(uncleared.id),
             "the cleared order must sort above the uncleared one despite its later delivery date",
         )
+
+    def test_forecast_far_out_order_sorts_below_ordinary_but_above_uncleared(self):
+        """Live question: S01471 (Scheduled Far Out, cleared months ago)
+        was sorting ABOVE S01532 (an ordinary cleared order, cleared
+        later) purely because its clearance_date happened to be
+        earlier — even though the far-out order has NO real claim on
+        anything right now (or for months), while the ordinary order
+        genuinely competes. Being cleared doesn't matter once an order
+        is excluded from the queue entirely for being scheduled too far
+        out — it must sort below every line that's still actually
+        competing. But it must still sort ABOVE an uncleared/no_invoice
+        order — explicit product decision: having been genuinely cleared
+        at some point, however excluded right now, still outranks never
+        having had a real claim on stock at all."""
+        self._set_stock(0)
+        far_out = self._make_order(self.partner_a, 10)
+        far_out.pick_scheduled_date = fields.Datetime.now() + relativedelta(months=8)
+        self.assertEqual(far_out.order_line.clearance_defer_reason, "Scheduled Far Out")
+
+        ordinary = self._make_order(self.partner_b, 10)
+        ordinary.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=30)
+        # Explicit, distinct timestamps — far_out cleared FIRST (earlier
+        # clearance_date), which would normally rank it first too.
+        earlier = fields.Datetime.now() - timedelta(days=10)
+        later = fields.Datetime.now() - timedelta(days=5)
+        far_out.with_context(clearance_internal_write=True).write({"clearance_date": earlier})
+        ordinary.with_context(clearance_internal_write=True).write({"clearance_date": later})
+
+        uncleared = self._make_admin_only_order(self.partner_c, 10)
+        uncleared.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=15)
+
+        for order in (far_out, ordinary, uncleared):
+            order.order_line.move_ids.invalidate_recordset()
+            self.assertNotEqual(order.order_line.move_ids.state, "assigned")
+
+        report = self.env["stock.forecasted_product_product"].with_context(warehouse=self.warehouse.id)
+        data = report._get_report_data(product_ids=[self.product.id])
+        order_ids_in_order = [
+            l["document_out"]["id"] for l in data["lines"]
+            if l.get("document_out") and l["document_out"].get("_name") == "sale.order"
+        ]
+        self.assertLess(
+            order_ids_in_order.index(ordinary.id),
+            order_ids_in_order.index(far_out.id),
+            "the far-out order must sort below the ordinary one despite its earlier clearance timestamp",
+        )
+        self.assertLess(
+            order_ids_in_order.index(far_out.id),
+            order_ids_in_order.index(uncleared.id),
+            "the far-out order must still sort above an uncleared/no_invoice order",
+        )
+
+    def test_forecast_unreserved_lines_sort_by_clearance_not_delivery_date(self):
+        """Explicit product decision: clearance timestamp is ALWAYS the
+        leading signal for who gets stock next — an order's place in the
+        queue is its place in the queue, whether or not it currently
+        holds anything yet. A later-clearance order needed SOONER
+        (earlier delivery date) must still sort BELOW an earlier-
+        clearance order needed later, matching the order the real engine
+        will actually satisfy them in once stock arrives — the display
+        must mirror the real allocation order, not need-date urgency."""
+        order_needed_soon = self._make_order(self.partner_a, 10)
+        order_needed_soon.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=5)
+        order_needed_soon.with_context(clearance_internal_write=True).write(
+            {"clearance_date": fields.Datetime.now()}
+        )
+
+        order_earlier_clearance = self._make_order(self.partner_b, 10)
+        order_earlier_clearance.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=60)
+        order_earlier_clearance.with_context(clearance_internal_write=True).write(
+            {"clearance_date": fields.Datetime.now() - timedelta(days=1)}
+        )
+
+        for order in (order_needed_soon, order_earlier_clearance):
+            order.order_line.move_ids.invalidate_recordset()
+            self.assertNotEqual(order.order_line.move_ids.state, "assigned")
+
+        report = self.env["stock.forecasted_product_product"].with_context(warehouse=self.warehouse.id)
+        data = report._get_report_data(product_ids=[self.product.id])
+        order_ids_in_order = [
+            l["document_out"]["id"] for l in data["lines"]
+            if l.get("document_out") and l["document_out"].get("_name") == "sale.order"
+        ]
+        self.assertLess(
+            order_ids_in_order.index(order_earlier_clearance.id),
+            order_ids_in_order.index(order_needed_soon.id),
+            "earlier clearance timestamp must sort first, even though it's needed later by delivery date",
+        )
+
+    def test_forecast_reserved_lines_sort_by_delivery_not_clearance_date(self):
+        """Explicit product decision, the mirror image of the unreserved
+        block's own rule: once stock is actually in hand, clearance
+        priority has already done its job — deciding WHO holds it. From
+        there, WHEN it's needed is what matters, so the reserved block
+        sorts by delivery date, not clearance date."""
+        self._set_stock(20)
+        order_earlier_clearance = self._make_order(self.partner_a, 10)
+        order_earlier_clearance.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=60)
+        # fields.Datetime.now() truncates to whole seconds, so two orders
+        # confirmed within the same second can otherwise land on an
+        # identical clearance_date — pin them explicitly apart instead of
+        # relying on real-time confirmation timing.
+        order_earlier_clearance.with_context(clearance_internal_write=True).write(
+            {"clearance_date": fields.Datetime.now() - timedelta(days=1)}
+        )
+
+        order_needed_soon = self._make_order(self.partner_b, 10)
+        order_needed_soon.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=5)
+
+        for order in (order_earlier_clearance, order_needed_soon):
+            order.order_line.invalidate_recordset()
+            self.assertEqual(order.order_line.move_ids.quantity, 10, "fully reserved")
+        self.assertLess(order_earlier_clearance.clearance_date, order_needed_soon.clearance_date)
+
+        report = self.env["stock.forecasted_product_product"].with_context(warehouse=self.warehouse.id)
+        data = report._get_report_data(product_ids=[self.product.id])
+        order_ids_in_order = [
+            l["document_out"]["id"] for l in data["lines"]
+            if l.get("document_out") and l["document_out"].get("_name") == "sale.order"
+        ]
+        self.assertLess(
+            order_ids_in_order.index(order_needed_soon.id),
+            order_ids_in_order.index(order_earlier_clearance.id),
+            "once reserved, the line needed SOONER must sort first, despite its later clearance timestamp",
+        )
+
+    def test_forecast_split_line_remainder_stays_beneath_its_own_reserved_portion(self):
+        """Even though the reserved block now sorts by delivery date, a
+        split line's own still-unfulfilled remainder must stay pinned
+        directly beneath its own reserved portion — never sorted away
+        from it, regardless of what else is in the report."""
+        self._set_stock(6)
+        order = self._make_order(self.partner_a, 10)
+        scheduled = fields.Datetime.now() + relativedelta(days=30)
+        order.pick_scheduled_date = scheduled
+        order.order_line.invalidate_recordset()
+        self.assertEqual(order.order_line.move_ids.quantity, 6, "partially fulfilled")
+
+        self._create_committed_po(10, scheduled - timedelta(days=14))
+        self.env.invalidate_all()
+        self.assertEqual(order.order_line.clearance_defer_reason, "Scheduled Future Stock")
+
+        # An unrelated, fully reserved order for a different product,
+        # needed LATER than this split order's own 30-day delivery date.
+        # The reserved block sorts by delivery date and always sits
+        # entirely before the unreserved block — so without the pinning
+        # logic, this later-needed order would sort AFTER the split
+        # line's reserved chunk within the reserved block, landing
+        # between it and the remainder (which only appears once the
+        # whole reserved block ends). A sooner-needed decoy would NOT
+        # prove this — it sorts before the split's reserved chunk, never
+        # between the two rows.
+        other_product = self.env["product.product"].create({
+            "name": "Split Adjacency Widget", "is_storable": True,
+        })
+        self._set_stock(10, product=other_product)
+        later_order = self._make_order(self.partner_b, 10, product=other_product)
+        later_order.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=90)
+
+        report = self.env["stock.forecasted_product_product"].with_context(warehouse=self.warehouse.id)
+        data = report._get_report_data(product_ids=[self.product.id, other_product.id])
+        order_ids_in_order = [
+            l["document_out"]["id"] for l in data["lines"]
+            if l.get("document_out") and l["document_out"].get("_name") == "sale.order"
+        ]
+        order_indexes = [i for i, oid in enumerate(order_ids_in_order) if oid == order.id]
+        self.assertEqual(len(order_indexes), 2, "expected the reserved chunk and the waiting remainder")
+        self.assertEqual(
+            order_indexes[1], order_indexes[0] + 1,
+            "the split line's remainder must sit directly beneath its own reserved portion",
+        )
+
+    def test_forecast_incoming_allocation_orders_by_clearance_priority_not_creation_order(self):
+        """The forecast engine must rank by clearance priority, not by
+        whichever order happened to be created (or scheduled) first —
+        the same guarantee _reserve_by_clearance provides for CURRENT
+        stock, now extended to a committed but not-yet-arrived shipment.
+        A naive "whoever's first in the queryset" ordering would hand
+        this to the order created first; clearance priority says
+        otherwise."""
+        self._set_stock(0)
+        first_created = self._make_order(self.partner_a, 10)
+        second_created = self._make_order(self.partner_b, 10)
+        second_created.with_context(clearance_internal_write=True).write(
+            {"clearance_date": fields.Datetime.now() - timedelta(days=1)}
+        )
+        self._create_committed_po(10, fields.Datetime.now() + timedelta(days=20))
+        self.env.invalidate_all()
+
+        allocation = self.env["sale.order"]._forecast_incoming_allocation(product_ids=[self.product.id])
+        first_move = first_created.order_line.move_ids
+        second_move = second_created.order_line.move_ids
+        self.assertEqual(
+            sum(e["qty"] for e in allocation.get(second_move.id, [])), 10,
+            "the earlier-clearance order wins the shipment despite being created second",
+        )
+        self.assertEqual(allocation.get(first_move.id, []), [], "nothing left for the later-clearance order")
+
+        second_created.order_line.invalidate_recordset()
+        self.assertEqual(second_created.order_line.expected_incoming_qty, 10, "exposed the same way via the field")
+        self.assertTrue(second_created.order_line.expected_incoming_fully_covers_remaining)
+
+    def test_forecast_incoming_allocation_splits_across_multiple_shipments(self):
+        """A demand line spanning more than one committed shipment gets
+        an itemized breakdown, not just a single collapsed number — an
+        external consumer needs to know it's coming in two pieces."""
+        self._set_stock(0)
+        order = self._make_order(self.partner_a, 15)
+        self._create_committed_po(10, fields.Datetime.now() + timedelta(days=10))
+        po2 = self._create_committed_po(10, fields.Datetime.now() + timedelta(days=20))
+        po2_move = po2.picking_ids.move_ids
+        self.env.invalidate_all()
+        order.order_line.invalidate_recordset()
+
+        self.assertEqual(order.order_line.expected_incoming_qty, 15)
+        self.assertTrue(order.order_line.expected_incoming_fully_covers_remaining)
+        breakdown = order.order_line.expected_incoming_breakdown
+        self.assertEqual(len(breakdown), 2, "expected one entry per committed shipment drawn from")
+        self.assertEqual(sum(e["qty"] for e in breakdown), 15)
+        self.assertEqual(
+            order.order_line.expected_incoming_date, po2_move.date,
+            "the date shown is when the LAST needed shipment lands, not the first partial arrival",
+        )
+
+    def test_forecast_incoming_allocation_partial_coverage(self):
+        """When even every committed shipment together falls short of the
+        line's own demand, that must be visible, not silently rounded up
+        to 'covered'."""
+        self._set_stock(0)
+        order = self._make_order(self.partner_a, 20)
+        self._create_committed_po(8, fields.Datetime.now() + timedelta(days=10))
+        self.env.invalidate_all()
+        order.order_line.invalidate_recordset()
+
+        self.assertEqual(order.order_line.expected_incoming_qty, 8)
+        self.assertFalse(
+            order.order_line.expected_incoming_fully_covers_remaining,
+            "8 committed against a demand of 20 must not read as fully covered",
+        )
+
+    def test_forecast_incoming_allocation_respects_force_reserve_and_hard_lock_tiers(self):
+        """The same tiering _reserve_by_clearance uses for real stock must
+        hold for a forecast against a not-yet-arrived shipment too: a
+        force-reserved line outranks an earlier-clearance but otherwise
+        ordinary competitor, and a purely hard-locked no_invoice line
+        (no genuine clearance, no force-reserve of its own) has no
+        acquisition ability at all — same as it has none in the real
+        queue."""
+        self._set_stock(0)
+        early_clearance = self._make_order(self.partner_a, 10)
+        early_clearance.with_context(clearance_internal_write=True).write(
+            {"clearance_date": fields.Datetime.now() - timedelta(days=5)}
+        )
+        force_reserved = self._make_admin_only_order(self.partner_b, 10)
+        force_reserved.order_line.write({"is_force_reserved": True})
+        hard_locked_no_invoice = self._make_admin_only_order(self.partner_c, 10)
+        hard_locked_no_invoice.order_line.write({"is_reservation_hard_locked": True})
+
+        self._create_committed_po(10, fields.Datetime.now() + timedelta(days=10))
+        self.env.invalidate_all()
+
+        allocation = self.env["sale.order"]._forecast_incoming_allocation(product_ids=[self.product.id])
+        force_move = force_reserved.order_line.move_ids
+        early_move = early_clearance.order_line.move_ids
+        locked_move = hard_locked_no_invoice.order_line.move_ids
+
+        self.assertEqual(
+            sum(e["qty"] for e in allocation.get(force_move.id, [])), 10,
+            "force-reserve outranks an earlier-clearance but non-overridden competitor",
+        )
+        self.assertEqual(
+            allocation.get(early_move.id, []), [],
+            "nothing left for the earlier-clearance line once force-reserve took it",
+        )
+        self.assertNotIn(
+            locked_move.id, allocation,
+            "a purely hard-locked no_invoice line has no acquisition ability at all, so it's never even considered",
+        )
+
+    def test_forecast_incoming_allocation_excludes_far_future_unless_overridden(self):
+        """Mirrors test_far_future_orders_excluded_unless_overridden for
+        the forecast side: an order scheduled more than 6 months out must
+        not be shown as entitled to a committed shipment either, unless
+        hard-locked or force-reserved."""
+        self._set_stock(0)
+        order = self._make_order(self.partner_a, 10)
+        order.pick_scheduled_date = fields.Datetime.now() + relativedelta(months=8)
+        self._create_committed_po(10, fields.Datetime.now() + timedelta(days=10))
+        self.env.invalidate_all()
+
+        allocation = self.env["sale.order"]._forecast_incoming_allocation(product_ids=[self.product.id])
+        move = order.order_line.move_ids
+        self.assertEqual(
+            allocation.get(move.id, []), [],
+            "a far-future order must not be forecast as covered, even by a committed shipment",
+        )
+
+        order.write({"is_reservation_hard_locked": True})
+        self.env.invalidate_all()
+        allocation = self.env["sale.order"]._forecast_incoming_allocation(product_ids=[self.product.id])
+        self.assertEqual(
+            sum(e["qty"] for e in allocation.get(move.id, [])), 10,
+            "hard lock overrides the far-future exclusion in the forecast too",
+        )
+
+    def test_forecast_incoming_allocation_ignores_chained_ship_leg(self):
+        """An order whose Pick has already completed (only its Ship leg
+        still open) must never itself be forecast as claiming incoming
+        stock — that demand was already satisfied by the Pick; counting
+        the chained Ship move too would double-book the same units."""
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        pick = order.picking_ids.filtered(
+            lambda p: p.picking_type_id == order.warehouse_id.pick_type_id
+        )
+        pick.button_validate()
+
+        ship_move = order.order_line.move_ids.filtered(lambda m: m.state not in ("done", "cancel"))
+        self.assertTrue(ship_move, "Ship leg should still be open")
+        self.assertNotEqual(ship_move.picking_type_id, self.warehouse.pick_type_id)
+
+        self._create_committed_po(10, fields.Datetime.now() + timedelta(days=10))
+        self.env.invalidate_all()
+        allocation = self.env["sale.order"]._forecast_incoming_allocation(product_ids=[self.product.id])
+        self.assertNotIn(ship_move.id, allocation, "the Ship leg must never itself claim incoming stock")
+
+    def test_forecast_incoming_allocation_agrees_with_scheduled_future_stock_release(self):
+        """The forecast must predict exactly what _reserve_by_clearance
+        will actually do once a promised shipment lands — reconstructs
+        the same holder/early/force-reserve scenario as
+        test_scheduled_future_stock_releases_to_earlier_scheduled_order_and_reclaims_ahead_of_force_reserve,
+        but checks the forecast BEFORE the PO physically arrives."""
+        self._set_stock(10)
+        holder = self._make_order(self.partner_a, 10)
+        holder_scheduled = fields.Datetime.now() + relativedelta(days=30)
+        holder.pick_scheduled_date = holder_scheduled
+        holder.order_line.invalidate_recordset()
+        self.assertEqual(holder.order_line.move_ids.quantity, 10)
+
+        po = self._create_committed_po(10, holder_scheduled - timedelta(days=14))
+        self.env.invalidate_all()
+        self.assertEqual(holder.order_line.clearance_defer_reason, "Scheduled Future Stock")
+
+        early = self._make_order(self.partner_b, 10)
+        early.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=5)
+        self.env["sale.order"]._reserve_by_clearance(product_ids=[self.product.id])
+        holder.order_line.invalidate_recordset()
+        early.order_line.invalidate_recordset()
+        self.assertEqual(holder.order_line.move_ids.quantity, 0, "holder gave up its stock")
+
+        early.order_line.write({"is_reservation_hard_locked": True})
+        late_force = self._make_admin_only_order(self.partner_c, 10)
+        late_force.order_line.write({"is_force_reserved": True})
+
+        # Before the PO ever arrives: the forecast must already show the
+        # released holder, not the later force-reserve, as entitled to it.
+        allocation = self.env["sale.order"]._forecast_incoming_allocation(product_ids=[self.product.id])
+        holder_move = holder.order_line.move_ids
+        force_move = late_force.order_line.move_ids
+        self.assertEqual(
+            sum(e["qty"] for e in allocation.get(holder_move.id, [])), 10,
+            "forecast must credit the released holder ahead of the later force-reserve",
+        )
+        self.assertEqual(allocation.get(force_move.id, []), [])
+
+        # And once it actually lands, real reservation must agree with
+        # what the forecast already predicted.
+        po.picking_ids.button_validate()
+        holder.order_line.invalidate_recordset()
+        late_force.order_line.invalidate_recordset()
+        self.assertEqual(
+            holder.order_line.move_ids.filtered(lambda m: m.state not in ("done", "cancel")).quantity, 10,
+        )
+        self.assertEqual(late_force.order_line.move_ids.quantity, 0)
+
+    def test_stock_forecasted_report_exposes_incoming_forecast_and_suppresses_misleading_flag(self):
+        """The forecast report must surface this module's own
+        clearance-priority-correct forecast, and flag that native's own
+        Reserve link (if it would otherwise show one here) is driven by
+        priority-blind ins-matching rather than this module's queue."""
+        self._set_stock(0)
+        order = self._make_order(self.partner_a, 10)
+        po = self._create_committed_po(10, fields.Datetime.now() + timedelta(days=15))
+        self.env.invalidate_all()
+        order.order_line.invalidate_recordset()
+
+        report = self.env["stock.forecasted_product_product"].with_context(warehouse=self.warehouse.id)
+        data = report._get_report_data(product_ids=[self.product.id])
+        lines_for_order = [
+            l for l in data["lines"]
+            if l.get("document_out") and l["document_out"].get("id") == order.id
+        ]
+        self.assertTrue(lines_for_order)
+        line = lines_for_order[0]
+        self.assertTrue(line.get("clearance_incoming_forecast"))
+        self.assertEqual(
+            line["clearance_incoming_forecast"]["qty"], order.order_line.expected_incoming_qty,
+        )
+        self.assertEqual(
+            line["clearance_incoming_forecast"]["purchase_order_id"], po.id,
+            "needed so the frontend can render a clickable link straight to the real PO",
+        )
+        self.assertTrue(
+            line.get("clearance_reserve_is_misleading"),
+            "an unreserved out-line must be flagged so the JS knows not to trust native's own Reserve link here",
+        )
+
+    def test_purchase_order_is_receipt_confirmed_requires_both_fields(self):
+        """The receive date only counts as genuinely confirmed once BOTH
+        the container reference and the port arrival date are on file —
+        either alone is not enough."""
+        po = self._create_committed_po(10, fields.Datetime.now() + timedelta(days=15), confirmed=False)
+        self.assertFalse(po.is_receipt_confirmed, "neither field set yet")
+
+        po.container_reference = "MSCU1234567"
+        self.assertFalse(po.is_receipt_confirmed, "only the container reference is set")
+
+        po.port_arrival_date = fields.Date.today()
+        self.assertTrue(po.is_receipt_confirmed, "both fields are now set")
+
+        po.container_reference = False
+        self.assertFalse(po.is_receipt_confirmed, "clearing either field un-confirms it again")
+
+    def test_confirming_receipt_pushes_transit_time_onto_date_planned_and_move_date(self):
+        """Confirming a PO (container reference + port arrival date both
+        on file) must push the port arrival date plus the fixed
+        harbor-to-warehouse transit time (GOODS_TRANSIT_DAYS) onto the
+        PO line's own date_planned AND its linked incoming move's own
+        date — not just date_planned alone, since date_planned's own
+        write() (purchase_stock) only ever updates the move's
+        date_deadline, never its date, which is what this module's whole
+        engine actually reads."""
+        po = self._create_committed_po(10, fields.Datetime.now() + timedelta(days=1), confirmed=False)
+        move = po.picking_ids.move_ids
+        port_arrival_date = fields.Date.today() + timedelta(days=5)
+        expected = fields.Datetime.to_datetime(port_arrival_date) + timedelta(days=GOODS_TRANSIT_DAYS)
+
+        po.write({"container_reference": "MSCU2222222", "port_arrival_date": port_arrival_date})
+        move.invalidate_recordset()
+
+        self.assertEqual(po.order_line.date_planned, expected, "Expected Arrival must reflect the transit-adjusted date")
+        self.assertEqual(move.date, expected, "the move's own date is what the engine actually reads")
+
+    def test_editing_expected_arrival_by_hand_updates_the_move_date_too(self):
+        """Bug found live: editing "Expected Arrival" directly (an
+        unconfirmed PO — no separate transit-time sync involved at all)
+        only ever updated the move's date_deadline via native's own
+        write() (purchase_stock) — never its actual date, the field this
+        module's whole engine reads. The forecast's Receipt column
+        silently kept showing the ORIGINAL date forever, no matter how
+        many times "Expected Arrival" was edited by hand."""
+        po = self._create_committed_po(10, fields.Datetime.now() + timedelta(days=10), confirmed=False)
+        move = po.picking_ids.move_ids
+        new_date = fields.Datetime.now() + timedelta(days=25)
+
+        po.order_line.write({"date_planned": new_date})
+        move.invalidate_recordset()
+
+        self.assertEqual(move.date, new_date, "the move's own date must follow a manual Expected Arrival edit too")
+
+    def test_changing_committed_po_date_auto_reruns_the_queue(self):
+        """Bug motivation: a promised future shipment's own date can move
+        (a rescheduled PO, or purchase_order.py's own transit-time sync)
+        after a holder has already released stock under "Scheduled
+        Future Stock" — the queue must re-evaluate immediately, not wait
+        for some unrelated later event to eventually touch the same
+        product. Deliberately never calls _reserve_by_clearance
+        explicitly — only stock_move.py's own write() hook should."""
+        self._set_stock(10)
+        holder = self._make_order(self.partner_a, 10)
+        holder_scheduled = fields.Datetime.now() + relativedelta(days=30)
+        holder.pick_scheduled_date = holder_scheduled
+
+        po = self._create_committed_po(10, holder_scheduled - timedelta(days=14))
+        self.env.invalidate_all()
+        self.assertEqual(holder.order_line.clearance_defer_reason, "Scheduled Future Stock")
+
+        early = self._make_order(self.partner_b, 10)
+        early.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=5)
+        self.env["sale.order"]._reserve_by_clearance(product_ids=[self.product.id])
+        holder.order_line.invalidate_recordset()
+        self.assertEqual(holder.order_line.move_ids.quantity, 0, "holder gave up its stock")
+        self.assertTrue(holder.order_line.is_scheduled_future_stock_release)
+
+        # The promised shipment's port arrival slips to AFTER the
+        # holder's own scheduled date — no margin left at all. Only the
+        # PO write happens here, no explicit _reserve_by_clearance call.
+        po.write({"port_arrival_date": holder_scheduled.date() + timedelta(days=1)})
+        self.env.invalidate_all()
+
+        self.assertFalse(
+            holder.order_line.is_scheduled_future_stock_release,
+            "the move's own date changing must have re-run the queue immediately, "
+            "via stock_move.py's write() hook, with no explicit trigger",
+        )
+
+    def test_forecast_surfaces_purchase_order_confirmed_status(self):
+        """A confirmed PO's status must flow all the way through: the
+        allocation engine, the plugin-facing breakdown on the sale order
+        line, and the forecast report's own line dict — so the frontend
+        badge and any external consumer agree with each other."""
+        self._set_stock(0)
+        order = self._make_order(self.partner_a, 10)
+        po = self._create_committed_po(10, fields.Datetime.now() + timedelta(days=15))
+        self.env.invalidate_all()
+        order.order_line.invalidate_recordset()
+
+        self.assertTrue(po.is_receipt_confirmed)
+        breakdown = order.order_line.expected_incoming_breakdown
+        self.assertTrue(breakdown)
+        self.assertTrue(
+            breakdown[0]["purchase_order_confirmed"],
+            "the plugin-facing breakdown must carry the PO's confirmed status",
+        )
+
+        report = self.env["stock.forecasted_product_product"].with_context(warehouse=self.warehouse.id)
+        data = report._get_report_data(product_ids=[self.product.id])
+        lines_for_order = [
+            l for l in data["lines"]
+            if l.get("document_out") and l["document_out"].get("id") == order.id
+        ]
+        self.assertTrue(lines_for_order)
+        self.assertTrue(
+            lines_for_order[0]["clearance_incoming_forecast"]["confirmed"],
+            "the forecast report's own line must reflect the same confirmed status",
+        )
+
+    def _make_draft_order(self, partner, qty, product=None, commitment_date=None):
+        vals = {
+            "partner_id": partner.id,
+            "order_line": [(0, 0, {
+                "product_id": (product or self.product).id,
+                "product_uom_qty": qty,
+            })],
+        }
+        if commitment_date is not None:
+            vals["commitment_date"] = commitment_date
+        return self.env["sale.order"].create(vals)
+
+    def test_clearance_availability_draft_line_sees_only_real_leftover_on_hand(self):
+        """A draft (unconfirmed) line's simulated availability must
+        respect stock a higher-priority REAL order already holds — it
+        only ever sees genuine leftover, never the gross on-hand total."""
+        self._set_stock(10)
+        real_order = self._make_order(self.partner_a, 6)
+        real_order.order_line.invalidate_recordset()
+        self.assertEqual(real_order.order_line.move_ids.quantity, 6, "real order holds its 6 first")
+
+        draft = self._make_draft_order(self.partner_b, 10)
+        self.env.invalidate_all()
+        line = draft.order_line
+
+        self.assertEqual(line.clearance_availability_qty, 4, "only the genuine leftover, not the gross 10 on hand")
+        self.assertFalse(line.clearance_availability_fully_covered)
+        self.assertEqual(line.clearance_availability_status, "short")
+
+    def test_clearance_availability_draft_line_forecasts_future_po_coverage(self):
+        """A draft line's remaining need, once on-hand is exhausted, must
+        be forecast against committed future incoming POs — same
+        priority-aware allocation the real engine would use once
+        confirmed."""
+        self._set_stock(0)
+        far_future = fields.Datetime.now() + relativedelta(days=60)
+        draft = self._make_draft_order(self.partner_a, 10, commitment_date=far_future)
+        po = self._create_committed_po(10, fields.Datetime.now() + timedelta(days=20))
+        self.env.invalidate_all()
+        line = draft.order_line
+
+        self.assertEqual(line.clearance_availability_qty, 10)
+        self.assertTrue(line.clearance_availability_fully_covered)
+        self.assertEqual(line.clearance_availability_date, po.picking_ids.move_ids.date)
+        self.assertEqual(line.clearance_availability_status, "available")
+        self.assertIn(po.name, line.clearance_availability_source)
+        self.assertEqual(
+            line.clearance_reserved_qty, "0",
+            "must reflect what's in stock NOW, not the full forecast including the future PO",
+        )
+        self.assertEqual(len(line.clearance_availability_breakdown), 1)
+        self.assertEqual(
+            line.clearance_availability_breakdown[0]["purchase_order_id"], po.id,
+            "the itemized breakdown must carry the PO's real id so the tooltip can link to it",
+        )
+        self.assertEqual(line.clearance_availability_breakdown[0]["purchase_order_name"], po.name)
+
+    def test_clearance_availability_draft_line_short_with_nothing_committed(self):
+        """Nothing on hand and nothing committed anywhere — the draft
+        line must show as genuinely short, not silently zero-but-fine."""
+        self._set_stock(0)
+        draft = self._make_draft_order(self.partner_a, 10)
+        self.env.invalidate_all()
+        line = draft.order_line
+
+        self.assertEqual(line.clearance_availability_qty, 0.0)
+        self.assertFalse(line.clearance_availability_fully_covered)
+        self.assertEqual(line.clearance_availability_status, "short")
+
+    def test_clearance_availability_confirmed_order_reflects_real_state(self):
+        """Once confirmed, the same badge must reflect the real
+        reservation state directly — no simulation involved."""
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        order.order_line.invalidate_recordset()
+        line = order.order_line
+
+        self.assertEqual(line.clearance_availability_qty, 10)
+        self.assertTrue(line.clearance_availability_fully_covered)
+        self.assertEqual(line.clearance_availability_status, "available")
+
+    def test_clearance_availability_late_when_covered_after_commitment_date(self):
+        """Fully covered eventually by a committed PO, but only after the
+        order's own commitment date — must be flagged late, not shown as
+        plainly available."""
+        self._set_stock(0)
+        soon = fields.Datetime.now() + relativedelta(days=5)
+        draft = self._make_draft_order(self.partner_a, 10, commitment_date=soon)
+        self._create_committed_po(10, fields.Datetime.now() + timedelta(days=20))
+        self.env.invalidate_all()
+        line = draft.order_line
+
+        self.assertTrue(line.clearance_availability_fully_covered)
+        self.assertTrue(line.clearance_availability_late)
+        self.assertEqual(line.clearance_availability_status, "late")
 
 
 @tagged("post_install", "-at_install")

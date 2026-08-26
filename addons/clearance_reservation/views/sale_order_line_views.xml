@@ -1,0 +1,72 @@
+<odoo>
+    <!-- Native's own qty_at_date_widget icon (fa-area-chart, click to
+         open a popover) is hidden outright — its own
+         virtual_available_at_date is a priority-blind net total (core's
+         _compute_quantities_dict), the same class of flaw this module
+         already corrects everywhere else. "Reserved"
+         (clearance_reserved_qty) replaces it: a plain, colour-coded
+         number between Quantity and Delivered — how much of this line's
+         own demand is genuinely in stock/held right now — backed by a
+         HOVER popover (clearance_availability_field.js) mirroring
+         native's own click-popover layout, but with this module's
+         clearance-priority-correct numbers, no click needed. -->
+    <record id="view_order_form_clearance_availability" model="ir.ui.view">
+        <field name="name">sale.order.form.clearance.availability</field>
+        <field name="model">sale.order</field>
+        <field name="inherit_id" ref="sale.view_order_form"/>
+        <field name="arch" type="xml">
+            <!-- class="d-none" (plain CSS hide) rather than relying only
+                 on invisible="1" — a <widget> node's visibility is
+                 resolved through separately pre-extracted widget info
+                 rather than the same live prop path a <field>'s
+                 invisible goes through, so the declarative modifier
+                 alone didn't actually hide it; a literal display:none
+                 class always does. Two separate, explicit anchors — one
+                 per occurrence (list row + per-line form popup) — since
+                 a single generic //widget[...] xpath only ever patched
+                 the first match, leaving the other one fully visible. -->
+            <xpath expr="//page/field[@name='order_line']/list/widget[@name='qty_at_date_widget']" position="attributes">
+                <attribute name="invisible">1</attribute>
+                <attribute name="class">d-none</attribute>
+            </xpath>
+            <xpath expr="//page/field[@name='order_line']/form/group/group/div[@name='ordered_qty']/widget[@name='qty_at_date_widget']" position="attributes">
+                <attribute name="invisible">1</attribute>
+                <attribute name="class">d-none</attribute>
+            </xpath>
+            <!-- Whole-unit display only — Quantity/Delivered otherwise
+                 show 2 decimal places (native's own default precision)
+                 while Reserved (a plain integer-ish count) doesn't,
+                 which is what actually made the three columns read as
+                 unevenly spaced — same digits everywhere makes all three
+                 columns equally compact. -->
+            <xpath expr="//page/field[@name='order_line']/list/field[@name='product_uom_qty']" position="attributes">
+                <attribute name="digits">[16, 0]</attribute>
+            </xpath>
+            <xpath expr="//page/field[@name='order_line']/list/field[@name='qty_delivered']" position="attributes">
+                <attribute name="digits">[16, 0]</attribute>
+            </xpath>
+            <!-- The two data-only helper fields are deliberately NOT
+                 sandwiched between Quantity and Reserved — even
+                 column_invisible, a hidden column sitting right at that
+                 border confused the browser's own column-resize handle
+                 hit-target there. Declared once at the end of the row
+                 instead, well away from any border a user would
+                 actually try to drag. -->
+            <xpath expr="//page/field[@name='order_line']/list/field[@name='qty_delivered']" position="before">
+                <field name="clearance_reserved_qty" widget="clearance_availability" optional="show"
+                       class="text-end" style="width: 1%; white-space: nowrap;"/>
+            </xpath>
+            <xpath expr="//page/field[@name='order_line']/list/field[@name='qty_delivered']" position="after">
+                <field name="clearance_availability_status" column_invisible="True"/>
+                <field name="clearance_availability_source" column_invisible="True"/>
+                <field name="clearance_availability_breakdown" column_invisible="True"/>
+            </xpath>
+            <xpath expr="//page/field[@name='order_line']/form/group/group/div[@name='ordered_qty']/field[@name='product_uom_qty']" position="after">
+                <field name="clearance_availability_status" invisible="1"/>
+                <field name="clearance_availability_source" invisible="1"/>
+                <field name="clearance_availability_breakdown" invisible="1"/>
+                <field name="clearance_reserved_qty" widget="clearance_availability" readonly="1"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>

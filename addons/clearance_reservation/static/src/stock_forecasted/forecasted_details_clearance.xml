@@ -45,12 +45,175 @@
                       t-att-title="this._lockTitle(line.lock_reason)">
                     <i t-attf-class="fa #{this._lockIcon(line.lock_reason)} me-1"/><t t-out="line.lock_reason"/>
                 </span>
+                <!-- Something IS coming (a reservation or a forecasted
+                     PO) — just not in time for this line's own need
+                     date, so it'll ship as a backorder rather than in
+                     full. Deliberately separate from a red background
+                     (removed from this column below): red reads as
+                     "nothing coming at all," which "Not Available"
+                     already covers in the Replenishment column — this
+                     is a different, less alarming condition. -->
+                <span t-if="line.clearance_incoming_forecast and line.clearance_incoming_forecast.is_late"
+                      class="badge text-bg-warning ms-1"
+                      title="A shipment is forecasted, but not in time for this line's own need date — this will ship as a backorder">
+                    <i class="fa fa-clock-o me-1"/>Backorder
+                </span>
             </div>
         </xpath>
         <!-- Full replace (not just the button) — keeps the native picking
              link (useful navigation) but drops the trailing " reserved"
              text after it, and gives the button the conditional red
              styling. -->
+        <!-- Native's own document_in link is exactly the priority-blind
+             ins-match this module distrusts (see stock_forecasted.py's
+             clearance_reserve_is_misleading) — hidden here, not just its
+             Reserve button (which doesn't exist on this branch anyway),
+             since the naked PO name/link reads as fact on its own. This
+             is core's only t-out="line.document_in.name" element, so
+             it's a safe, unique anchor. -->
+        <xpath expr="//a[@t-out='line.document_in.name']" position="attributes">
+            <attribute name="t-attf-class">fw-bold #{line.clearance_reserve_is_misleading ? 'd-none' : ''}</attribute>
+        </xpath>
+        <!-- Native's chain still structurally "wins" via the (now hidden)
+             document_in branch above rather than falling through to its
+             own "Not Available" — the cell would otherwise render blank
+             for a misleading line with no forecast of our own (e.g.
+             S01524). Rather than rewrite t-if/t-elif directives on a
+             shared, multi-branch chain (risky — those control which
+             sibling renders at all, not just one element's own display),
+             insert our own equivalent text here, gated on exactly that
+             combination. -->
+        <xpath expr="//a[@t-out='line.document_in.name']" position="after">
+            <span t-if="line.clearance_reserve_is_misleading and !line.clearance_incoming_forecast" class="text-muted">Not Available</span>
+        </xpath>
+        <!-- Native's own "Not Available" fallback must not show ALONGSIDE
+             this module's own answer when we have one — same class-hide
+             technique as the document_in link above. -->
+        <xpath expr="//span[@t-else='' and @class='text-muted']" position="attributes">
+            <attribute name="t-attf-class">text-muted #{line.clearance_incoming_forecast ? 'd-none' : ''}</attribute>
+        </xpath>
+        <!-- A SEPARATE branch of the same chain — reached whenever native's
+             own priority-blind aggregate check (replenishment_filled) came
+             back true even though no specific document_in ever matched
+             (exactly the misleading case, e.g. S01468's split remainder) —
+             showing "Inventory On Hand" right alongside this module's own
+             (correct) forecast link/badge above, with nothing to hide it.
+             Full replace, condition (t-if="line.document_out") kept
+             identical — only the text itself gains a class-hide wrapper,
+             same principle as the document_in link and "Not Available"
+             fallback just above, never rewriting which branch fires. -->
+        <xpath expr="//t[@t-elif='line.replenishment_filled']/t[@t-if='line.document_out']" position="replace">
+            <t t-if="line.document_out">
+                <span t-attf-class="#{line.clearance_reserve_is_misleading ? 'd-none' : ''}">Inventory On Hand</span>
+                <button t-if="displayReserve(line)"
+                    class="btn btn-sm btn-primary"
+                    name="reserve_link"
+                    t-on-click="() => this._reserve(line.move_out.id)">
+                    Reserve
+                </button>
+            </t>
+        </xpath>
+        <!-- This module's own clearance-priority-correct answer, shown in
+             the exact same slot AND style as native's document_in link —
+             same tag, same (and only) "fw-bold" class, no added text,
+             wrapper, or size — a straight swap of which PO it points to,
+             not a redesigned cell. The Receipt column already carries
+             the date (see below), so it isn't repeated here; qty and
+             partial-coverage go in the title tooltip instead of visible
+             text, same way native's own elements elsewhere in this
+             report use title for supplementary detail without adding
+             bulk. Renders whenever this line has a real forecast,
+             independent of whether native's own link was hidden above —
+             covers both "native guessed wrong" (its link is hidden, ours
+             takes the same spot) and "native showed nothing at all" (its
+             own chain never had a link here to begin with — ours simply
+             appears). A split-source line (drawing from more than one
+             committed PO) can still only carry ONE link here, same
+             structural limit native's own single move_in/one-link-per-row
+             design already has. -->
+        <xpath expr="//a[@t-out='line.document_in.name']" position="before">
+            <a t-if="line.clearance_incoming_forecast" href="#" class="fw-bold"
+               t-out="line.clearance_incoming_forecast.source"
+               t-att-title="_formatFloat(line.clearance_incoming_forecast.qty) + (line.clearance_incoming_forecast.fully_covers_remaining ? '' : ' (partial)')"
+               t-on-click.prevent="() => this.props.openView('purchase.order', 'form', line.clearance_incoming_forecast.purchase_order_id)"/>
+            <!-- Container reference + port arrival date both on file for
+                 this shipment (purchase_order.py's is_receipt_confirmed)
+                 — the receive date is a confirmed logistics fact, not
+                 just a plan. Same boat icon either way; only the badge
+                 colour flips (green = confirmed, red = still just a
+                 plan) so the two read as one continuum, not two
+                 unrelated indicators. -->
+            <span t-if="line.clearance_incoming_forecast and line.clearance_incoming_forecast.confirmed"
+                  class="badge text-bg-success ms-1"
+                  title="Container reference and port arrival date are both on file for this shipment">
+                <i class="fa fa-ship"/>
+            </span>
+            <span t-if="line.clearance_incoming_forecast and !line.clearance_incoming_forecast.confirmed"
+                  class="badge text-bg-danger ms-1"
+                  title="Not yet confirmed — no container reference / port arrival date on file, this is still just a planned date">
+                <i class="fa fa-ship"/>
+            </span>
+        </xpath>
+        <!-- The Replenishment column's own red/white background
+             (is_late), the Receipt column's date AND its own red/white
+             background, and the Used-by/Delivery columns' red/white
+             background (!replenishment_filled) are ALL native flags
+             derived from the exact same priority-blind ins-match as
+             everything above — patched here too, for every order-demand
+             row (line.document_out set), so the whole row is internally
+             consistent instead of the link/text being fixed while its
+             surrounding colour and dates still tell the old story. Rows
+             that aren't about a specific order's demand at all (no
+             document_out — e.g. a bare "Free Stock" or leftover unused
+             incoming line) are untouched, falling back to native's
+             own flags exactly as before. -->
+        <xpath expr="//tr[@t-foreach='clearanceSortedLines']/td[1]" position="attributes">
+            <attribute name="t-attf-class">#{((line.document_out and !line.reservation) ? line.clearance_is_late_or_unavailable : line.is_late) and 'o_grid_warning table-danger'}</attribute>
+        </xpath>
+        <xpath expr="//tr[@t-foreach='clearanceSortedLines']/td[2]" position="attributes">
+            <attribute name="t-out">(line.document_out and !line.reservation) ? (line.clearance_receipt_date or '') : (line.receipt_date or '')</attribute>
+            <!-- Centered. Cutting the cell's own left/right padding
+                 alone (0.5rem -> 0.25rem -> 0.125rem, three rounds) never
+                 actually shrank the visible gap around the date, because
+                 in an auto-layout table the COLUMN's width — not the
+                 cell's padding — is what was creating the whitespace;
+                 padding alone can't shrink a column already wider than
+                 its content. width:1% + white-space:nowrap is the
+                 standard trick to make an auto-layout table column
+                 shrink to fit its content instead of sharing the
+                 table's leftover space — combined with the padding cut
+                 above, the date now sits with only that minimal padding
+                 on either side, not the column's own width padding it
+                 out further. -->
+            <attribute name="t-attf-class">text-center #{((line.document_out and !line.reservation) ? line.clearance_is_late_or_unavailable : line.is_late) and 'o_grid_warning table-danger'}</attribute>
+            <attribute name="style">padding-left: 0.125rem; padding-right: 0.125rem; width: 1%; white-space: nowrap;</attribute>
+        </xpath>
+        <!-- Explicit product decision: this column never shows a red
+             background at all, regardless of coverage state — "nothing
+             coming" already reads clearly via the Replenishment
+             column's own "Not Available" text, and "something's coming
+             but too late" now has its own, less alarming Backorder
+             badge above instead of a red flag. -->
+        <xpath expr="//td[@name='usedby_cell']" position="attributes">
+            <attribute name="t-attf-class"></attribute>
+        </xpath>
+        <xpath expr="//td[@t-out=&quot;line.delivery_date or ''&quot;]" position="attributes">
+            <attribute name="t-attf-class">#{((line.document_out and !line.reservation) ? line.clearance_is_late_or_unavailable : !line.replenishment_filled) and 'o_grid_warning table-danger'}</attribute>
+        </xpath>
+        <!-- The Units column's own "-" shortfall marker was still keyed
+             off native's raw, priority-blind replenishment_filled flag —
+             the one column left unpatched, so a line we already show as
+             genuinely covered (white background, a real forecast link)
+             could still show a "-" here, or vice versa, contradicting
+             every other signal on the same row. Not a t-if/t-elif chain
+             (no sibling elif/else depends on this exact node), so
+             overriding its own condition carries none of the
+             chain-branching risk the reservation/replenishment_filled
+             chain above does — same ternary already used for the
+             Used-by/Delivery backgrounds. -->
+        <xpath expr="//t[@t-if='! line.replenishment_filled']" position="attributes">
+            <attribute name="t-if">(line.document_out and !line.reservation) ? line.clearance_is_late_or_unavailable : !line.replenishment_filled</attribute>
+        </xpath>
         <xpath expr="//t[@t-elif='line.reservation']" position="replace">
             <t t-elif="line.reservation">
                 <a t-out="line.reservation.name" href="#" class="fw-bold"

@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<templates xml:space="preserve">
+    <t t-name="clearance_reservation.ClearanceAvailabilityField">
+        <span t-if="value" t-attf-class="d-block text-end fw-bold #{statusClass}" t-out="value"
+              t-on-mouseenter="onMouseEnter" t-on-mouseleave="onMouseLeave"/>
+    </t>
+    <t t-name="clearance_reservation.ClearanceAvailabilityPopover">
+        <div class="p-2 o_clearance_availability_popover"
+             t-on-mouseenter="() => props.onMouseEnter()" t-on-mouseleave="() => props.onMouseLeave()">
+            <h6>Availability</h6>
+            <table class="table table-borderless table-sm mb-0">
+                <tbody>
+                    <tr>
+                        <td><strong>Reserved</strong></td>
+                        <td class="text-end"><b t-out="props.record.data.clearance_reserved_qty"/></td>
+                    </tr>
+                    <tr t-foreach="props.record.data.clearance_availability_breakdown or []" t-as="chunk" t-key="chunk_index">
+                        <td colspan="2" t-attf-class="fw-bold fs-6 #{sourceClass}">
+                            <t t-out="chunk.prefix"/>
+                            <a t-if="chunk.purchase_order_id" href="#"
+                               t-on-click.prevent="() => this.openPurchaseOrder(chunk.purchase_order_id)"
+                               t-out="chunk.purchase_order_name"/>
+                            <t t-out="chunk.suffix"/>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+            <div class="text-center">
+                <a href="#" t-on-click.prevent="openForecast">
+                    <i class="oi oi-fw o_button_icon oi-arrow-right"/>View Forecast
+                </a>
+            </div>
+        </div>
+    </t>
+</templates>

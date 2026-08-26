@@ -5,3 +5,6 @@ __pycache__/
 .env
 config/odoo.conf
 Caddyfile
+
+# DB dumps are transferred to the server directly, not versioned
+backups/

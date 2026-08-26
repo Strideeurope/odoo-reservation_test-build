@@ -13,6 +13,21 @@ patch(ForecastedDetails.prototype, {
         this.clearanceSortState.mode = mode;
     },
 
+    // Native Reserve/Unreserve visibility is driven by whether native's
+    // own priority-blind ins-matching happened to mark this line
+    // "coverable" (see stock_forecasted.py's _prepare_report_line) — for
+    // an unreserved line, clicking it would reserve whatever native
+    // matched, not whatever this module's clearance queue would actually
+    // pick. Suppressed there in favor of the read-only forecast badge;
+    // left alone everywhere else (e.g. the real Unreserve link on an
+    // already-reserved line, which this flag is never set for).
+    displayReserve(line) {
+        if (line.clearance_reserve_is_misleading) {
+            return false;
+        }
+        return super.displayReserve(line);
+    },
+
     // "Locked" here means an active override with a real claim — hard
     // lock or force-reserve — never "Scheduled Far Out" or "Scheduled
     // Future Stock", which are the opposite of locked (a line explicitly
@@ -25,6 +40,14 @@ patch(ForecastedDetails.prototype, {
         return reason === "Scheduled Far Out" || reason === "Scheduled Future Stock";
     },
     _lockBadgeClass(reason) {
+        // Distinct from "Scheduled Future Stock" (text-bg-warning, an
+        // ACTIVE protected claim expecting a shipment back) — "Scheduled
+        // Far Out" is the opposite: no claim on anything at all, for
+        // months. text-bg-info reads as "informational, inactive"
+        // rather than "watch this, something's pending".
+        if (reason === "Scheduled Far Out") {
+            return "text-bg-info";
+        }
         return this._isDeferReason(reason) ? "text-bg-warning" : "text-bg-secondary";
     },
     _lockIcon(reason) {

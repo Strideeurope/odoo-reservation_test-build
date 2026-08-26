@@ -1,0 +1,8 @@
+// Plain links in this popover (View Forecast, the PO link) must never
+// show the browser's default focus outline/ring — explicit product
+// decision, applies to every link here, present and future.
+.o_clearance_availability_popover a:focus,
+.o_clearance_availability_popover a:focus-visible {
+    outline: none;
+    box-shadow: none;
+}
