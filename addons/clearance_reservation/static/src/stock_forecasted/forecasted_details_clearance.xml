@@ -83,14 +83,28 @@
              sibling renders at all, not just one element's own display),
              insert our own equivalent text here, gated on exactly that
              combination. -->
-        <xpath expr="//a[@t-out='line.document_in.name']" position="after">
-            <span t-if="line.clearance_reserve_is_misleading and !line.clearance_incoming_forecast" class="text-muted">Not Available</span>
-        </xpath>
         <!-- Native's own "Not Available" fallback must not show ALONGSIDE
              this module's own answer when we have one — same class-hide
              technique as the document_in link above. -->
         <xpath expr="//span[@t-else='' and @class='text-muted']" position="attributes">
             <attribute name="t-attf-class">text-muted #{line.clearance_incoming_forecast ? 'd-none' : ''}</attribute>
+        </xpath>
+        <!-- Inserted AFTER the whole native if/elif/.../else chain
+             (anchored on its own final t-else span), never inside it.
+             An earlier version placed this directly after the
+             document_in link instead — a new t-if sibling sitting
+             between that link and native's own t-elif="line.reservation"
+             breaks QWeb's elif/else attachment, silently re-rooting the
+             reservation/in_transit/replenishment_filled/else branches
+             onto this element instead of onto document_in. That let a
+             row with a real (CSS-hidden) document_in link ALSO fall
+             through to "Free Stock" underneath it — both rendered
+             concatenated in the same cell. Positioned after the chain's
+             own last sibling instead, this can never break that
+             adjacency: it's a fully independent, self-contained
+             condition, not a link in the native chain. -->
+        <xpath expr="//span[@t-else='' and @class='text-muted']" position="after">
+            <span t-if="line.clearance_reserve_is_misleading and !line.clearance_incoming_forecast" class="text-muted">Not Available</span>
         </xpath>
         <!-- A SEPARATE branch of the same chain — reached whenever native's
              own priority-blind aggregate check (replenishment_filled) came
