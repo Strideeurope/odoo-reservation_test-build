@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <record id="view_stock_picking_type_list_for_user_ot_wizard" model="ir.ui.view">
+        <field name="name">stock.picking.type.list.user.ot.wizard</field>
+        <field name="model">stock.picking.type</field>
+        <field name="arch" type="xml">
+            <list create="0" delete="0">
+                <field name="name" string="Operation Type"/>
+                <field name="warehouse_id" string="Warehouse"/>
+                <field name="company_id" string="Company"/>
+            </list>
+        </field>
+    </record>
+
+    <record id="view_res_users_allowed_operation_type_wizard_form" model="ir.ui.view">
+        <field name="name">res.users.allowed.operation.type.wizard.form</field>
+        <field name="model">res.users.allowed.operation.type.wizard</field>
+        <field name="arch" type="xml">
+            <form string="Allowed Operation Types">
+                <field name="user_id" invisible="1"/>
+                <field name="warehouse_ids" invisible="1"/>
+
+                <div class="o_row mb-2">
+                    <button name="action_select_all" type="object" string="Select All" class="btn-secondary"/>
+                    <button name="action_unselect_all" type="object" string="Unselect All" class="btn-secondary ms-2"/>
+                </div>
+
+                <separator string="Allowed Operation Types"/>
+
+                <field name="operation_type_ids"
+                       nolabel="1"
+                       mode="list"
+                       domain="[('warehouse_id', 'in', warehouse_ids)]"
+                       context="{'list_view_ref': 'ventor_base.view_stock_picking_type_list_for_user_ot_wizard'}"
+                       options="{'no_create': True, 'no_open': True}"/>
+
+                <footer>
+                    <button name="action_save" type="object" string="Save" class="btn-primary"/>
+                    <button string="Cancel" special="cancel" class="btn-secondary"/>
+                </footer>
+            </form>
+        </field>
+    </record>
+
+</odoo>
