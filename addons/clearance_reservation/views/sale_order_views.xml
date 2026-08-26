@@ -4,41 +4,19 @@
         <field name="model">sale.order</field>
         <field name="inherit_id" ref="sale.view_order_form"/>
         <field name="arch" type="xml">
-            <!-- Header info strip, anchored on oe_title exactly like this
-                 module's own picking-form badge (stock_picking_views.xml)
-                 — same anchor, same "at a glance, above the native two-
-                 column Customer/Order groups" position, so the two forms
-                 read as one consistent design language instead of the
-                 clearance fields living in a different spot on each. -->
-            <xpath expr="//div[hasclass('oe_title')]" position="after">
-                <div class="o_row flex-wrap column-gap-4 row-gap-1 text-muted mb-3">
-                    <div>
-                        <field name="fulfillment_stage_label" string="Fulfillment Stage" widget="badge" readonly="1"
-                               decoration-muted="fulfillment_stage_label == 'No Invoice'"
-                               decoration-danger="fulfillment_stage_label == 'No Payment'"
-                               decoration-info="fulfillment_stage == 'grace_period'"
-                               decoration-warning="fulfillment_stage == 'order_pick'"
-                               decoration-success="fulfillment_stage == 'ship'"/>
-                    </div>
-                    <div>
-                        <label for="clearance_date" string="Clearance Timestamp" class="me-1"/>
-                        <field name="clearance_date" nolabel="1" class="oe_inline"/>
-                    </div>
-                    <div>
-                        <label for="pick_scheduled_date" class="me-1"/>
-                        <field name="pick_scheduled_date" nolabel="1" class="oe_inline"/>
-                    </div>
-                    <div>
-                        <label for="fulfillment_stage" string="Override Stage" class="me-1"/>
-                        <field name="fulfillment_stage" nolabel="1" class="oe_inline"/>
-                    </div>
-                    <div>
-                        <field name="pick_fully_validated" invisible="1"/>
-                        <label for="is_reservation_hard_locked" string="Reservation Lock" class="me-1"/>
-                        <field name="is_reservation_hard_locked" nolabel="1" widget="boolean_toggle"
-                               readonly="pick_fully_validated"/>
-                    </div>
-                </div>
+            <xpath expr="//field[@name='partner_id']" position="after">
+                <field name="fulfillment_stage_label" string="Fulfillment Stage" widget="badge" readonly="1"
+                       decoration-muted="fulfillment_stage_label == 'No Invoice'"
+                       decoration-danger="fulfillment_stage_label == 'No Payment'"
+                       decoration-info="fulfillment_stage == 'grace_period'"
+                       decoration-warning="fulfillment_stage == 'order_pick'"
+                       decoration-success="fulfillment_stage == 'ship'"/>
+                <field name="fulfillment_stage" string="Override Stage"/>
+                <field name="clearance_date" string="Clearance Timestamp"/>
+                <field name="pick_scheduled_date"/>
+                <field name="pick_fully_validated" invisible="1"/>
+                <field name="is_reservation_hard_locked" widget="boolean_toggle"
+                       readonly="pick_fully_validated"/>
             </xpath>
             <!-- order_line's "sol_o2m" widget renders TWO sub-views: a <form>
                  used only for the mobile/kanban quick-edit popup, and the
