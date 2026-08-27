@@ -287,18 +287,19 @@ class SaleOrder(models.Model):
             # _do_unreserve actually checks. Deliberately NOT scoped to just
             # Pick-type moves: the hard lock's own flagging step (in
             # _reserve_by_clearance) applies to every open move across the
-            # order, Ship leg included, once its origin Pick has completed —
-            # Output-level stock is still genuinely contested between
-            # multiple orders whose Picks are already done, so the lock
-            # legitimately protects that leg too, and release must clear it
-            # there as well. Never touches a line the user independently
-            # force-reserved or hard-locked on its own — those are separate
-            # protections released only through their own path.
+            # order, Ship leg included, once its origin Pick has completed
+            # — so release must clear it there as well. Never touches a
+            # line the user independently force-reserved or hard-locked on
+            # its own, or a move that's independently protected for having
+            # genuinely reached Output (see _clearance_is_output_move) —
+            # those are separate protections released only through their
+            # own path (Output protection has no release path at all).
             for order in newly_unlocked:
                 locked_moves = order.order_line.move_ids.filtered(
                     lambda m: m.is_locked_reservation
                     and not m.sale_line_id.is_force_reserved
                     and not m.sale_line_id.is_reservation_hard_locked
+                    and not self._clearance_is_output_move(m)
                 )
                 locked_moves.write({"is_locked_reservation": False})
 
@@ -698,6 +699,32 @@ class SaleOrder(models.Model):
             and not sale_line.is_force_reserved
         )
 
+    @api.model
+    def _clearance_is_output_move(self, move):
+        """Once a Ship-leg move has actually claimed real stock out of the
+        warehouse's Output location, it's earmarked to this order — same
+        automatic release-immunity category as a hard lock, force-reserve,
+        or a Scheduled Future Stock holder, not a priority tier: it grants
+        no acquisition power of its own, it only keeps what's already been
+        won. No lock needed, and none can be toggled off — the moment a
+        move genuinely sources from Output, this applies on every
+        subsequent run for as long as it still does.
+
+        A Pick-leg move's source is Stock (or a picking-zone sub-location
+        of it), never Output, so this can never mistakenly protect a
+        Pick-type move — only a Ship-leg move drawing from Output matches.
+        """
+        if move.state not in ("assigned", "partially_available"):
+            return False
+        warehouse = move.picking_id.picking_type_id.warehouse_id or move.picking_type_id.warehouse_id
+        output_location = warehouse.wh_output_stock_loc_id
+        if not output_location or not move.location_id.parent_path:
+            return False
+        return bool(
+            move.location_id == output_location
+            or move.location_id.parent_path.startswith(output_location.parent_path)
+        )
+
     def _reserve_by_clearance(self, product_ids=None):
         """Run the clearance queue, optionally scoped to a set of product
         (variant) ids. Scoping to specific products is safe without breaking
@@ -879,11 +906,14 @@ class SaleOrder(models.Model):
         # nothing about scheduled dates and could otherwise hand their
         # stock to a merely earlier-CLEARANCE (but later-scheduled, or
         # unscheduled) order — not the guarantee this tag exists to make.
+        # A move that's already reached Output is protected too — see
+        # _clearance_is_output_move — automatically, with no lock needed.
         protected = touched.filtered(
             lambda m: m.is_locked_reservation
             or m.sale_line_id.order_id.is_reservation_hard_locked
             or m.sale_line_id.is_reservation_hard_locked
             or m.sale_line_id.clearance_defer_reason == "Scheduled Future Stock"
+            or self._clearance_is_output_move(m)
         )
         releasable = (touched - protected).filtered(
             lambda m: m.state in ("assigned", "partially_available")
@@ -925,6 +955,10 @@ class SaleOrder(models.Model):
                 # force-reserved line that failed to grab anything when
                 # action_force_reserve() was first clicked and only just
                 # succeeded here, via this method's own automatic retry.
+                # Same for a Ship-leg move that just reached Output on this
+                # very pass — flagged immediately, not just protected from
+                # release on some later run, so it's also immune to
+                # cancel/relocate the instant it's genuinely at Output.
                 order = move.sale_line_id.order_id
                 sale_line = move.sale_line_id
                 if (
@@ -934,6 +968,7 @@ class SaleOrder(models.Model):
                         order.is_reservation_hard_locked
                         or sale_line.is_reservation_hard_locked
                         or sale_line.is_force_reserved
+                        or self._clearance_is_output_move(move)
                     )
                 ):
                     move.write({"is_locked_reservation": True})
@@ -945,8 +980,13 @@ class SaleOrder(models.Model):
         # scheduled dates), and only reached for once every ordinary and
         # newly-freed avenue for that competitor is already exhausted.
         for product_moves in by_product.values():
+            # A holder that's already reached Output is exempt from even
+            # this targeted trade — Output protection is unconditional,
+            # same as a hard lock, not just immunity from the ordinary
+            # blanket release above.
             holders = product_moves.filtered(
                 lambda m: m.sale_line_id.clearance_defer_reason == "Scheduled Future Stock"
+                and not self._clearance_is_output_move(m)
             )
             if not holders:
                 continue

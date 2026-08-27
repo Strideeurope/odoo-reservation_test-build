@@ -709,6 +709,93 @@ class TestClearanceReservation(TransactionCase):
             "release must clear the lock flag on the Ship leg too, not just Pick-type moves",
         )
 
+    def test_output_reached_move_survives_blanket_release_and_gets_locked(self):
+        """Once a Ship-leg move has actually claimed stock out of Output,
+        it's earmarked to its order — the ordinary blanket
+        release-and-reassign pass must never sweep it up and hand it to a
+        different, even earlier-cleared, competing order. No lock needed
+        for this: it's automatic, the same release-immunity category as a
+        hard lock, and it also gets is_locked_reservation flagged so
+        cancel/relocate respect it the same way too."""
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        pick = order.picking_ids.filtered(
+            lambda p: p.picking_type_id == order.warehouse_id.pick_type_id
+        )
+        pick.button_validate()
+
+        ship_move = order.order_line.move_ids.filtered(lambda m: m.state not in ("done", "cancel"))
+        self.assertTrue(ship_move, "Ship leg should still be open")
+        self.assertIn(ship_move.state, ("assigned", "partially_available"))
+        self.assertTrue(
+            ship_move.is_locked_reservation,
+            "a move that's genuinely reached Output must be auto-flagged, no lock needed",
+        )
+        self.assertEqual(ship_move.clearance_lock_reason, "At Output")
+
+        competitor = self._make_order(self.partner_b, 10)
+        competitor.with_context(clearance_internal_write=True).write(
+            {"clearance_date": order.clearance_date - timedelta(days=1)}
+        )
+        self.env["sale.order"]._reserve_by_clearance(product_ids=[self.product.id])
+
+        ship_move.invalidate_recordset()
+        competitor.order_line.invalidate_recordset()
+        self.assertEqual(ship_move.quantity, 10, "the Output-reached move must keep its stock")
+        self.assertEqual(
+            competitor.order_line.move_ids.quantity, 0,
+            "an earlier-cleared competitor still can't reclaim Output-protected stock",
+        )
+
+    def test_output_reached_move_exempt_from_scheduled_future_stock_trade(self):
+        """Output protection is unconditional — a holder that's already
+        reached Output must be exempt even from the targeted Scheduled
+        Future Stock trade, not just the ordinary blanket release."""
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        pick = order.picking_ids.filtered(
+            lambda p: p.picking_type_id == order.warehouse_id.pick_type_id
+        )
+        pick.button_validate()
+        ship_move = order.order_line.move_ids.filtered(lambda m: m.state not in ("done", "cancel"))
+        self.assertTrue(ship_move.is_locked_reservation)
+
+        # Flag it as a Scheduled Future Stock holder despite already being
+        # at Output — Output protection must still win.
+        order.order_line.write({"is_scheduled_future_stock_release": True})
+        order.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=30)
+
+        demand_order = self._make_order(self.partner_b, 10)
+        demand_order.pick_scheduled_date = fields.Datetime.now() + relativedelta(days=5)
+        self._create_committed_po(10, fields.Datetime.now() + relativedelta(days=3))
+
+        self.env["sale.order"]._reserve_by_clearance(product_ids=[self.product.id])
+        ship_move.invalidate_recordset()
+        demand_order.order_line.invalidate_recordset()
+        self.assertEqual(ship_move.quantity, 10, "an Output-protected holder must never give up its stock")
+
+    def test_releasing_unrelated_hard_lock_does_not_strip_output_protection(self):
+        """Releasing a hard lock (or force-reserve) on an order/line must
+        never clear is_locked_reservation on a move that's independently
+        protected for genuinely having reached Output — that protection
+        has no release path of its own at all."""
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        order.write({"is_reservation_hard_locked": True})
+        pick = order.picking_ids.filtered(
+            lambda p: p.picking_type_id == order.warehouse_id.pick_type_id
+        )
+        pick.button_validate()
+        ship_move = order.order_line.move_ids.filtered(lambda m: m.state not in ("done", "cancel"))
+        self.assertTrue(ship_move.is_locked_reservation)
+
+        order.write({"is_reservation_hard_locked": False})
+        ship_move.invalidate_recordset()
+        self.assertTrue(
+            ship_move.is_locked_reservation,
+            "releasing the hard lock must not strip the move's independent Output protection",
+        )
+
     def test_far_future_orders_excluded_unless_overridden(self):
         """Explicit product decision: an order scheduled more than 6 months
         out has no claim on today's scarce stock, even if it would

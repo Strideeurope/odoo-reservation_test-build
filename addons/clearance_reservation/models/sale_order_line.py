@@ -653,11 +653,15 @@ class SaleOrderLine(models.Model):
             newly_unlocked.write({"hard_lock_date": False})
             # Clear the move-level lock the hard lock itself applied — but
             # never a lock the line independently picked up via
-            # action_force_reserve, that's a separate protection released
-            # only through its own unlock.
+            # action_force_reserve, or one earned by genuinely reaching
+            # Output (see sale_order.py's _clearance_is_output_move) —
+            # those are separate protections, and Output's has no unlock
+            # path at all.
             for line in newly_unlocked:
                 locked_moves = line.move_ids.filtered(
-                    lambda m: m.is_locked_reservation and not line.is_force_reserved
+                    lambda m: m.is_locked_reservation
+                    and not line.is_force_reserved
+                    and not self.env["sale.order"]._clearance_is_output_move(m)
                 )
                 locked_moves.write({"is_locked_reservation": False})
                 line.order_id.message_post(body=(
@@ -685,11 +689,14 @@ class SaleOrderLine(models.Model):
             # override is gone, since that flag is what _do_unreserve
             # actually checks. Mirrors the newly_unlocked branch above;
             # never touches a lock the line independently holds via its own
-            # hard lock, that's a separate protection released only through
-            # its own unlock.
+            # hard lock, or one earned by genuinely reaching Output — those
+            # are separate protections, and Output's has no unlock path at
+            # all.
             for line in newly_force_unreserved:
                 locked_moves = line.move_ids.filtered(
-                    lambda m: m.is_locked_reservation and not line.is_reservation_hard_locked
+                    lambda m: m.is_locked_reservation
+                    and not line.is_reservation_hard_locked
+                    and not self.env["sale.order"]._clearance_is_output_move(m)
                 )
                 locked_moves.write({"is_locked_reservation": False})
         # Increasing an already-confirmed line's quantity updates its move's

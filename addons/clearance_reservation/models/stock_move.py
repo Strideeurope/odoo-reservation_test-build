@@ -49,6 +49,8 @@ class StockMove(models.Model):
                 move.clearance_lock_reason = "Product Hard Lock"
             elif sale_line.is_force_reserved:
                 move.clearance_lock_reason = "Force Reserved"
+            elif self.env["sale.order"]._clearance_is_output_move(move):
+                move.clearance_lock_reason = "At Output"
             else:
                 # Reuses sale_order_line's own far-future check rather than
                 # re-deriving it a second time — keeps the wording (and the
