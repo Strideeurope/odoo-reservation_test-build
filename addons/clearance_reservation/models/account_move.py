@@ -54,6 +54,18 @@ class AccountMove(models.Model):
 
         payment_active = self.payment_state in ("partial", "in_payment", "paid")
 
+        # Whatever demotion note an order was carrying no longer applies
+        # the moment it genuinely has active payment again — regardless of
+        # whether that payment also happens to need a fresh/restored
+        # clearance_date (see needs_real_timestamp below) or the order
+        # already had one and just needed recognizing. Scoped to
+        # payment_active only; a demoted order that's still unpaid keeps
+        # its note.
+        if payment_active:
+            orders.filtered("clearance_last_demotion_reason").with_context(
+                clearance_internal_write=True
+            ).write({"clearance_last_demotion_reason": False})
+
         # Real payment always takes over the timestamp — whether the
         # order never had one at all, or its current one came from a
         # manual override rather than genuine payment. An override lets

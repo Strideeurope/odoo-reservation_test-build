@@ -504,15 +504,22 @@ class TestClearanceReservation(TransactionCase):
         controlled, unmistakably distinct sentinel timestamp instead of
         relying on wall-clock timing.
 
-        Uses a manual override to no_invoice to reach the
-        "has-a-backup, no current clearance_date" precondition — an
-        automatic demotion (refund, cancelled/draft invoice) no longer
-        touches clearance_date at all, so it can no longer produce this
-        state; only a manual override still can."""
+        Uses a manual override to no_invoice, on an order with NO invoice
+        of its own yet, to reach the "has-a-backup, no current
+        clearance_date" precondition — an automatic demotion (refund,
+        cancelled/draft invoice) no longer touches clearance_date at all,
+        so it can no longer produce this state; only a manual override
+        still can. Deliberately avoids overriding to no_invoice while a
+        real, currently-paid invoice already exists underneath: that's a
+        self-contradicting state (genuinely paid, but manually marked as
+        if unpaid) that the payment hook's own "real payment always wins"
+        logic immediately corrects, which would confuse this test's actual
+        target — the backup-vs-fresh-stamp choice on a real repayment."""
         self._set_stock(10)
-        order = self._make_order(self.partner_a, 10)
+        order = self._make_admin_only_order(self.partner_a, 10)
+        order.write({"fulfillment_stage": "order_pick"})
         original_clearance = order.clearance_date
-        invoice = self._pay_order(order)
+        self.assertTrue(original_clearance)
 
         order.write({"fulfillment_stage": "no_invoice"})
         self.assertFalse(order.clearance_date)
@@ -523,11 +530,10 @@ class TestClearanceReservation(TransactionCase):
             "odoo.addons.clearance_reservation.models.account_move.AccountMove._get_clearance_timestamp",
             return_value=sentinel,
         ):
-            # Force the payment-state hook to run again, simulating the
-            # same "recomputed more than once in one transaction" scenario
-            # the original bug was invisible under — no new genuine
-            # payment is needed to exercise this path.
-            invoice._compute_payment_state()
+            # The order's first-ever real invoice/payment — naturally
+            # exercises the payment hook's needs_real_timestamp/restore
+            # path, no forced recompute needed.
+            self._pay_order(order)
             self.assertNotEqual(order.clearance_date, sentinel, "must NOT have used the fresh timestamp")
             self.assertEqual(
                 order.clearance_date, original_clearance,
@@ -560,13 +566,20 @@ class TestClearanceReservation(TransactionCase):
         genuine payment is currently active), but the value underneath is
         the order's true original place in line, exactly as if it had
         never lost it. The backup here comes from a manual override to
-        no_invoice — the only way to reach a has-a-backup/no-clearance-
-        date state now that automatic demotions (refund, cancelled/draft
-        invoice) never touch clearance_date at all."""
+        no_invoice on an order with no invoice of its own yet — the only
+        way to reach a has-a-backup/no-clearance-date state now that
+        automatic demotions (refund, cancelled/draft invoice) never touch
+        clearance_date at all. Deliberately doesn't use a real invoice
+        here: overriding to no_invoice while a real payment is still
+        active would immediately self-correct via the payment hook's own
+        "real payment always wins" logic, rather than actually leaving the
+        order in a backed-up state — this test is purely about the
+        override round-trip, so no invoice is involved at all."""
         self._set_stock(10)
-        order = self._make_order(self.partner_a, 10)
+        order = self._make_admin_only_order(self.partner_a, 10)
+        order.write({"fulfillment_stage": "order_pick"})
         original_clearance = order.clearance_date
-        self._pay_order(order)
+        self.assertTrue(original_clearance)
 
         order.write({"fulfillment_stage": "no_invoice"})
         self.assertEqual(order.clearance_date_backup, original_clearance)
