@@ -221,12 +221,11 @@ class SaleOrder(models.Model):
         # flips get treated as a real transition; a redundant write of the
         # same value (e.g. re-saving a form) must never bump an order to the
         # back of the locked-queue, or re-run release cleanup, for no
-        # reason. Locking itself stays ungated (same as every other
-        # hard-lock entry point in this module), but RELEASING one needs the
-        # same override permission as the other manual bypasses — it's what
-        # used to be action_force_unlock_hard_lock's own gate, folded in
-        # here so the boolean_toggle slider alone is enough to both lock
-        # and release, with no separate button required.
+        # reason. Both directions — applying AND releasing — need the same
+        # override permission as the other manual bypasses — it's what used
+        # to be action_force_unlock_hard_lock's own gate, folded in here so
+        # the boolean_toggle slider alone is enough to both lock and
+        # release, with no separate button required.
         newly_locked = newly_unlocked = self.env["sale.order"]
         if "is_reservation_hard_locked" in vals:
             if vals["is_reservation_hard_locked"]:
@@ -234,15 +233,18 @@ class SaleOrder(models.Model):
             else:
                 newly_unlocked = self.filtered(lambda o: o.is_reservation_hard_locked)
 
+        applying_hard_lock = bool(newly_locked) and not self.env.context.get(
+            "clearance_internal_write"
+        )
         releasing_hard_lock = bool(newly_unlocked) and not self.env.context.get(
             "clearance_internal_write"
         )
-        if (manual_override or releasing_hard_lock) and not self.env.user.has_group(
-            "clearance_reservation.group_reservation_override"
-        ):
+        if (
+            manual_override or applying_hard_lock or releasing_hard_lock
+        ) and not self.env.user.has_group("clearance_reservation.group_reservation_override"):
             raise AccessError(
                 "You don't have permission to manually override the fulfillment "
-                "stage, clearance timestamp, or release a reservation hard lock."
+                "stage, clearance timestamp, or apply/release a reservation hard lock."
             )
 
         res = super().write(vals)

@@ -606,10 +606,10 @@ class SaleOrderLine(models.Model):
         # Snapshot BEFORE super().write() — only lines whose value actually
         # flips get treated as a real transition; a redundant write of the
         # same value must never bump a line to the back of the locked-queue,
-        # or re-run release cleanup, for no reason. Locking stays ungated;
-        # releasing needs the override permission — folded in here (used to
-        # live only in action_force_unlock_hard_lock) so the boolean_toggle
-        # slider alone is enough to both lock and release.
+        # or re-run release cleanup, for no reason. Both directions —
+        # applying AND releasing — need the override permission — folded in
+        # here (used to live only in action_force_unlock_hard_lock) so the
+        # boolean_toggle slider alone is enough to both lock and release.
         newly_locked = newly_unlocked = self.env["sale.order.line"]
         if "is_reservation_hard_locked" in vals:
             if vals["is_reservation_hard_locked"]:
@@ -625,14 +625,18 @@ class SaleOrderLine(models.Model):
             else:
                 newly_force_unreserved = self.filtered(lambda l: l.is_force_reserved)
 
-        if newly_unlocked and not self.env.user.has_group(
+        if (newly_locked or newly_unlocked) and not self.env.user.has_group(
             "clearance_reservation.group_reservation_override"
         ):
-            raise AccessError("You don't have permission to release a reservation hard lock.")
-        if newly_force_unreserved and not self.env.user.has_group(
+            raise AccessError(
+                "You don't have permission to apply or release a reservation hard lock."
+            )
+        if (newly_force_reserved or newly_force_unreserved) and not self.env.user.has_group(
             "clearance_reservation.group_reservation_override"
         ):
-            raise AccessError("You don't have permission to release a forced reservation.")
+            raise AccessError(
+                "You don't have permission to apply or release a forced reservation."
+            )
 
         res = super().write(vals)
 
@@ -732,6 +736,14 @@ class SaleOrderLine(models.Model):
     def action_force_reserve(self):
         """Bypass the clearance queue entirely for this line's stock moves.
         Works regardless of the order's fulfillment_stage."""
+        # Checked here, up front — not left to the write() gate below —
+        # because _action_assign() below actually moves stock before that
+        # write() ever happens; without this, an unauthorized user's click
+        # would still reserve real stock and only fail afterward when the
+        # is_force_reserved flag itself gets set, leaving the reservation
+        # made but unflagged and unlocked.
+        if not self.env.user.has_group("clearance_reservation.group_reservation_override"):
+            raise AccessError("You don't have permission to force-reserve stock.")
         for line in self:
             unassigned = line.move_ids.filtered(
                 lambda m: m.state in ("confirmed", "waiting", "partially_available")
