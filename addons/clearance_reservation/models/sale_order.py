@@ -63,11 +63,13 @@ class SaleOrder(models.Model):
     # dedicated, explicitly-editable "Override Clearance Timestamp" field
     # can expose it in the view without a blanket readonly blocking it.
     clearance_date = fields.Datetime(copy=False)
-    # Set only when clearance_date is cleared by a full-refund demotion to
-    # no_invoice (see _demote_from_ship_if_unpaid) — preserves the
-    # order's original place in line so getting paid again, or a manual
-    # override, restores it exactly rather than sending the order to the
-    # back as if it were brand new. Cleared once actually restored.
+    # Set only when clearance_date is cleared by a MANUAL override back to
+    # No Invoice (see write() below) — preserves the order's original
+    # place in line so getting paid again, or a manual override forward,
+    # restores it exactly rather than sending the order to the back as if
+    # it were brand new. Cleared once actually restored. Losing payment
+    # automatically (refund, cancelled/draft-reset invoice) no longer
+    # touches clearance_date at all — see _demote_from_ship_if_unpaid.
     clearance_date_backup = fields.Datetime(copy=False)
     # True whenever the CURRENT clearance_date came from a manual stage
     # override rather than genuine payment or grace-period confirmation.
@@ -78,6 +80,15 @@ class SaleOrder(models.Model):
     # False the moment a genuine payment event (re-)stamps clearance_date,
     # regardless of how it got set before.
     clearance_is_override = fields.Boolean(copy=False)
+    # Set by _demote_from_ship_if_unpaid whenever payment is lost with no
+    # stage change to make (already at Order/Pick) — records WHY in a
+    # filterable field, not just in the chatter, and doubles as a dedupe
+    # guard: Odoo can recompute payment_state (and re-run this check)
+    # several times within one transaction, and without something stored
+    # to compare against, that would re-post the same chatter note every
+    # time. Cleared the moment the order genuinely re-clears (real payment,
+    # or a manual override forward).
+    clearance_last_demotion_reason = fields.Char(copy=False)
     is_reservation_hard_locked = fields.Boolean(
         string="Lock Reservations",
         copy=False,
@@ -339,6 +350,7 @@ class SaleOrder(models.Model):
                             "clearance_date": resolved,
                             "clearance_date_backup": False,
                             "clearance_is_override": True,
+                            "clearance_last_demotion_reason": False,
                         })
                         if restoring_backup:
                             order.message_post(body=(
@@ -356,6 +368,9 @@ class SaleOrder(models.Model):
                                 f"replace this timestamp the moment it arrives."
                             ))
                 already_cleared = self - needing_clearance
+                already_cleared.with_context(clearance_internal_write=True).write({
+                    "clearance_last_demotion_reason": False,
+                })
                 for order in already_cleared:
                     order.message_post(body=(
                         f"Manual override: moved to {stage_label} "
@@ -524,21 +539,35 @@ class SaleOrder(models.Model):
                 order.with_context(clearance_internal_write=True).fulfillment_stage = "ship"
                 order.message_post(body="Order fully paid — promoted from Order/Pick to Ship.")
 
-    def _demote_from_ship_if_unpaid(self):
-        """If a "ship" or "order_pick" order is no longer fully paid — e.g.
-        a payment was reversed or a credit note settled the invoice back
-        down — drop it to reflect its real payment state:
+    def _demote_from_ship_if_unpaid(self, reason):
+        """If a "ship" or "order_pick" order is no longer fully paid — a
+        partial or full refund settling, an invoice being cancelled, reset
+        to draft, or any other way its payment backing disappears — drop
+        it to reflect that, but NEVER automatically further than
+        Order/Pick, regardless of how much (or how little) payment is
+        left:
 
         - Still has SOME active payment (a partial refund): order_pick,
           clearance_date untouched — it keeps its original place in line
           rather than losing priority just because payment status changed.
-        - Nothing is paid at all any more (a full refund): all the way
-          back to no_invoice, since it has no more genuine claim on stock
-          than any other unpaid order. clearance_date is backed up rather
-          than just discarded — getting paid again, or a manual override,
-          restores this order's ORIGINAL place in line instead of
-          sending it to the back as if it were brand new (see
-          _resolve_clearance_date).
+        - Nothing is paid at all any more (a full refund, a cancelled or
+          draft-reset invoice): STILL order_pick, clearance_date STILL
+          untouched, its reservation STILL held. Automatically dropping a
+          losing-payment order all the way to no_invoice used to release
+          its stock immediately — that's no longer automatic at all. Going
+          lower than Order/Pick is now only ever a deliberate,
+          permission-gated manual override (see write() above) — a genuine
+          cancellation is an explicit human decision, never an automatic
+          side effect of an invoice merely disappearing or being corrected.
+
+        `reason` is a short label for what actually triggered this check
+        (e.g. "Invoice cancelled", "Refund settled") — logged on the order
+        so its history shows why, not just that. Recorded on
+        clearance_last_demotion_reason too, both so it's a filterable
+        field rather than only chatter text, and so a repeat call in the
+        same transaction (Odoo can recompute payment_state, which drives
+        this, more than once per transaction) doesn't re-post the same
+        note every time nothing has actually changed since.
 
         An order currently at ship/order_pick via a manual OVERRIDE
         (clearance_is_override) is deliberately exempt — it was never
@@ -558,35 +587,35 @@ class SaleOrder(models.Model):
                 or order.clearance_is_override
             ):
                 continue
-            if order._has_active_payment():
-                if order.fulfillment_stage == "ship":
-                    order.with_context(clearance_internal_write=True).fulfillment_stage = "order_pick"
-                    order.message_post(body=(
-                        "Payment partially reversed — demoted from Ship to "
-                        "Order/Pick. Clearance timestamp untouched, keeps its "
-                        "original place in line."
-                    ))
-            else:
-                backed_up = order.clearance_date
+            if order.fulfillment_stage == "ship":
                 order.with_context(clearance_internal_write=True).write({
-                    "fulfillment_stage": "no_invoice",
-                    "clearance_date": False,
-                    "clearance_date_backup": order.clearance_date,
-                    "clearance_is_override": False,
+                    "fulfillment_stage": "order_pick",
+                    "clearance_last_demotion_reason": reason,
                 })
                 order.message_post(body=(
-                    f"Payment fully reversed — demoted to "
-                    f"{order._fulfillment_stage_label_for('no_invoice')}, no "
-                    f"genuine claim on stock left. Clearance timestamp "
-                    f"({backed_up}) backed up, restored automatically if it's "
-                    f"genuinely paid again."
+                    f"{reason} — demoted from Ship to Order/Pick. Clearance "
+                    f"timestamp untouched, keeps its original place in line. "
+                    f"Only a manual override can drop it to No Invoice."
+                ))
+            elif (
+                not order._has_active_payment()
+                and order.clearance_last_demotion_reason != reason
+            ):
+                order.with_context(clearance_internal_write=True).write({
+                    "clearance_last_demotion_reason": reason,
+                })
+                order.message_post(body=(
+                    f"{reason} — no active payment remains. Stays at "
+                    f"Order/Pick per policy: clearance timestamp and "
+                    f"reservation untouched. Only a manual override can "
+                    f"drop it to No Invoice."
                 ))
 
     def _resolve_clearance_date(self, fresh_timestamp):
         """The timestamp to actually stamp when an order becomes eligible
-        again — its backed-up ORIGINAL clearance_date if a full refund
-        previously wiped it (see _demote_from_ship_if_unpaid above),
-        otherwise the fresh timestamp for a genuinely new clearance."""
+        again — its backed-up ORIGINAL clearance_date if a manual override
+        back to No Invoice previously wiped it, otherwise the fresh
+        timestamp for a genuinely new clearance."""
         self.ensure_one()
         return self.clearance_date_backup or fresh_timestamp
 

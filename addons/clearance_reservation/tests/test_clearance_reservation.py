@@ -444,19 +444,17 @@ class TestClearanceReservation(TransactionCase):
             "a fully-paid order must reach Ship even though one of its lines has no stock reserved at all",
         )
 
-    def test_full_refund_demotes_to_no_invoice_and_backs_up_clearance(self):
-        """Bug: _is_fully_paid() only ever looked at out_invoice moves, so
-        refunding a fully-paid, shipped order left it sitting in Ship
-        forever — the refund itself was invisible both to the paid-status
-        check AND to the payment-change hook, which never fired for
-        out_refund moves at all.
-
-        Explicit product decision, on top of the fix: a FULL refund (no
-        money left paid at all) must drop the order all the way to
-        no_invoice, not just order_pick — it has no more genuine claim on
-        stock than any other unpaid order. Its original clearance_date is
-        backed up rather than discarded, so it isn't punished with a
-        fresh, later timestamp if it gets paid again.
+    def test_full_refund_demotes_to_order_pick_only_and_keeps_clearance(self):
+        """Product policy (revised from an earlier version of this test,
+        which required an automatic full refund to drop an order all the
+        way to no_invoice): a refund settling — full or partial — must
+        NEVER automatically demote an order below Order/Pick, and must
+        never touch its clearance_date or release its stock. Dropping all
+        the way to no_invoice is now only ever a deliberate,
+        permission-gated manual override (see write() above) — refunds in
+        practice are always paired with a manual order cancellation when
+        genuinely intended to release stock, never left to happen on
+        their own.
         """
         self._set_stock(10)
         order = self._make_order(self.partner_a, 10)
@@ -474,26 +472,27 @@ class TestClearanceReservation(TransactionCase):
         self.assertFalse(order._is_fully_paid(), "a settled refund must reverse the paid status")
         self.assertFalse(order._has_active_payment(), "nothing is paid at all any more")
         self.assertEqual(
-            order.fulfillment_stage, "no_invoice",
-            "a full refund must drop the order all the way to no_invoice, not just order_pick",
+            order.fulfillment_stage, "order_pick",
+            "a refund must only ever demote to order_pick, never automatically all the way to no_invoice",
         )
-        self.assertFalse(order.clearance_date, "no genuine claim left while unpaid")
-        self.assertEqual(
-            order.clearance_date_backup, original_clearance,
-            "the original clearance_date must be preserved, not discarded",
-        )
-
-        # Paying it again must restore the ORIGINAL timestamp, not stamp
-        # a fresh one that would send it to the back of the line.
-        self._pay_order(order)
-        self.assertEqual(order.fulfillment_stage, "ship")
         self.assertEqual(
             order.clearance_date, original_clearance,
-            "getting paid again must restore the order's original place in line",
+            "clearance_date must never be touched by an automatic demotion",
         )
-        self.assertFalse(order.clearance_date_backup, "the backup is consumed once restored")
+        self.assertFalse(order.clearance_date_backup, "nothing to back up — clearance_date was never cleared")
+        self.assertEqual(
+            order.clearance_last_demotion_reason, "Refund settled",
+            "the reason must be recorded even though the stage/timestamp are otherwise untouched",
+        )
 
-    def test_full_refund_then_real_payment_restores_backup_precisely(self):
+        # Genuine repayment simply re-promotes normally — nothing to
+        # restore, since clearance_date was never lost in the first place.
+        self._pay_order(order)
+        self.assertEqual(order.fulfillment_stage, "ship")
+        self.assertEqual(order.clearance_date, original_clearance)
+        self.assertFalse(order.clearance_last_demotion_reason, "cleared once genuinely re-paid")
+
+    def test_backup_restored_precisely_not_a_fresh_stamp_on_recompute(self):
         """Regression: a later rework of the payment hook (to let a
         manual override's fabricated timestamp be replaced by real
         payment) accidentally dropped the backup restoration entirely —
@@ -503,19 +502,20 @@ class TestClearanceReservation(TransactionCase):
         value (same ORM flush), which is exactly what let it slip past
         the original version of this test — pinned down here with a
         controlled, unmistakably distinct sentinel timestamp instead of
-        relying on wall-clock timing."""
+        relying on wall-clock timing.
+
+        Uses a manual override to no_invoice to reach the
+        "has-a-backup, no current clearance_date" precondition — an
+        automatic demotion (refund, cancelled/draft invoice) no longer
+        touches clearance_date at all, so it can no longer produce this
+        state; only a manual override still can."""
         self._set_stock(10)
         order = self._make_order(self.partner_a, 10)
         original_clearance = order.clearance_date
         invoice = self._pay_order(order)
 
-        refund = invoice._reverse_moves(cancel=False)
-        refund.action_post()
-        register = self.env["account.payment.register"].with_context(
-            active_model="account.move", active_ids=refund.ids
-        ).create({"payment_date": fields.Date.today()})
-        register._create_payments()
-        self.assertEqual(order.fulfillment_stage, "no_invoice")
+        order.write({"fulfillment_stage": "no_invoice"})
+        self.assertFalse(order.clearance_date)
         self.assertEqual(order.clearance_date_backup, original_clearance)
 
         sentinel = fields.Datetime.now() + relativedelta(years=5)
@@ -523,10 +523,11 @@ class TestClearanceReservation(TransactionCase):
             "odoo.addons.clearance_reservation.models.account_move.AccountMove._get_clearance_timestamp",
             return_value=sentinel,
         ):
-            self._pay_order(order)
-            # Read (forcing any deferred compute/flush) while the patch
-            # is still active — see the identical note in
-            # test_override_stamps_a_flagged_timestamp_that_real_payment_replaces.
+            # Force the payment-state hook to run again, simulating the
+            # same "recomputed more than once in one transaction" scenario
+            # the original bug was invisible under — no new genuine
+            # payment is needed to exercise this path.
+            invoice._compute_payment_state()
             self.assertNotEqual(order.clearance_date, sentinel, "must NOT have used the fresh timestamp")
             self.assertEqual(
                 order.clearance_date, original_clearance,
@@ -552,24 +553,22 @@ class TestClearanceReservation(TransactionCase):
             self._pay_order(order)
             self.assertEqual(order.clearance_date, sentinel, "no backup exists — the fresh timestamp must be used")
 
-    def test_override_after_full_refund_restores_backup_not_a_fresh_stamp(self):
-        """An admin override bringing a fully-refunded order back into
-        the queue must ALSO restore its backed-up original timestamp,
-        not stamp a brand-new one — it's still flagged
-        clearance_is_override (no genuine payment is currently active),
-        but the value underneath is the order's true original place in
-        line, exactly as if it had never lost it."""
+    def test_override_after_no_invoice_restores_backup_not_a_fresh_stamp(self):
+        """An admin override bringing a backed-up order back into the
+        queue must restore its backed-up original timestamp, not stamp a
+        brand-new one — it's still flagged clearance_is_override (no
+        genuine payment is currently active), but the value underneath is
+        the order's true original place in line, exactly as if it had
+        never lost it. The backup here comes from a manual override to
+        no_invoice — the only way to reach a has-a-backup/no-clearance-
+        date state now that automatic demotions (refund, cancelled/draft
+        invoice) never touch clearance_date at all."""
         self._set_stock(10)
         order = self._make_order(self.partner_a, 10)
         original_clearance = order.clearance_date
-        invoice = self._pay_order(order)
+        self._pay_order(order)
 
-        refund = invoice._reverse_moves(cancel=False)
-        refund.action_post()
-        register = self.env["account.payment.register"].with_context(
-            active_model="account.move", active_ids=refund.ids
-        ).create({"payment_date": fields.Date.today()})
-        register._create_payments()
+        order.write({"fulfillment_stage": "no_invoice"})
         self.assertEqual(order.clearance_date_backup, original_clearance)
 
         order.write({"fulfillment_stage": "order_pick"})
@@ -580,6 +579,45 @@ class TestClearanceReservation(TransactionCase):
         )
         self.assertTrue(order.clearance_is_override, "still flagged as override — no genuine payment is currently active")
         self.assertFalse(order.clearance_date_backup, "the backup is consumed once restored")
+
+    def test_invoice_cancelled_demotes_to_order_pick_with_reason(self):
+        """A posted invoice being cancelled — the bookkeeper's own VAT-
+        correction workflow, cancel-then-delete — must demote the order
+        exactly like a refund does: capped at Order/Pick, clearance_date
+        and the reservation untouched, with the specific reason recorded
+        both in the chatter and on clearance_last_demotion_reason."""
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        self._pay_order(order)
+        self.assertEqual(order.fulfillment_stage, "ship")
+        original_clearance = order.clearance_date
+
+        invoice = order.invoice_ids.filtered(lambda m: m.move_type == "out_invoice")
+        invoice.write({"state": "cancel"})
+
+        self.assertEqual(
+            order.fulfillment_stage, "order_pick",
+            "a cancelled invoice must demote to order_pick, never further automatically",
+        )
+        self.assertEqual(order.clearance_date, original_clearance, "clearance_date must never be touched")
+        self.assertEqual(order.clearance_last_demotion_reason, "Invoice cancelled")
+
+    def test_invoice_reset_to_draft_demotes_to_order_pick_with_reason(self):
+        """Same policy, for the invoice being reset to draft instead of
+        cancelled outright — both are ways the bookkeeper's own correction
+        workflow can make an invoice stop counting as posted."""
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        self._pay_order(order)
+        self.assertEqual(order.fulfillment_stage, "ship")
+        original_clearance = order.clearance_date
+
+        invoice = order.invoice_ids.filtered(lambda m: m.move_type == "out_invoice")
+        invoice.write({"state": "draft"})
+
+        self.assertEqual(order.fulfillment_stage, "order_pick")
+        self.assertEqual(order.clearance_date, original_clearance)
+        self.assertEqual(order.clearance_last_demotion_reason, "Invoice reset to draft")
 
     def test_no_clearance_timestamp_blocks_picking_validation(self):
         """A hard lock only ever earns the right to HOLD stock granted some

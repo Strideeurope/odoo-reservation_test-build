@@ -94,6 +94,7 @@ class AccountMove(models.Model):
                     "clearance_date": new_date,
                     "clearance_date_backup": False,
                     "clearance_is_override": False,
+                    "clearance_last_demotion_reason": False,
                 })
                 if was_override:
                     order.message_post(body=(
@@ -137,7 +138,7 @@ class AccountMove(models.Model):
             # already reaching Ship — ship depends on payment status alone,
             # so losing "paid" status demotes it back just as directly as
             # gaining it promoted it.
-            orders._demote_from_ship_if_unpaid()
+            orders._demote_from_ship_if_unpaid(reason="Payment reversed on the invoice")
 
     def _clearance_apply_refund_payment_state(self):
         """A refund (credit note) reversing an order's payment is invisible
@@ -149,4 +150,30 @@ class AccountMove(models.Model):
         self.ensure_one()
         orders = self.invoice_line_ids.sale_line_ids.order_id
         if orders:
-            orders._demote_from_ship_if_unpaid()
+            orders._demote_from_ship_if_unpaid(reason="Refund settled")
+
+    def write(self, vals):
+        # A posted invoice being cancelled or reset to draft loses its
+        # standing exactly like a refund does — but neither reconciliation
+        # change nor payment_state necessarily moves as a result (an
+        # invoice that was never reconciled in the first place has nothing
+        # to unreconcile), so this can't be left to _compute_payment_state
+        # above to catch. Snapshotting the affected orders BEFORE
+        # super().write() runs: once state is no longer "posted", nothing
+        # downstream should still treat this as a live invoice.
+        demote_reason = None
+        orders = self.env["sale.order"]
+        if "state" in vals and vals["state"] in ("cancel", "draft"):
+            leaving_posted = self.filtered(
+                lambda m: m.move_type == "out_invoice" and m.state == "posted"
+            )
+            if leaving_posted:
+                orders = leaving_posted.invoice_line_ids.sale_line_ids.order_id
+                demote_reason = (
+                    "Invoice cancelled" if vals["state"] == "cancel"
+                    else "Invoice reset to draft"
+                )
+        res = super().write(vals)
+        if orders:
+            orders._demote_from_ship_if_unpaid(reason=demote_reason)
+        return res
