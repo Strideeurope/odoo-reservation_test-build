@@ -31,8 +31,11 @@ class SaleOrderLine(models.Model):
         help="Same protection as the order-wide hard lock, but scoped to just "
              "this product on this order instead of the whole order: once "
              "stock is reserved for this line, it can never be unreserved by "
-             "any process, including manual overrides, and it bypasses the "
-             "payment gate to compete for stock immediately.",
+             "any process, including manual overrides. Grants no acquisition "
+             "power of its own — an unpaid, non-force-reserved line stays "
+             "unpaid and non-force-reserved for queue purposes, and will "
+             "never win new stock through the clearance queue on the strength "
+             "of this lock alone.",
     )
     # Mirrors sale_order.hard_lock_date exactly: stamped the moment this
     # line's own lock flips to True, cleared when it flips back to False.
