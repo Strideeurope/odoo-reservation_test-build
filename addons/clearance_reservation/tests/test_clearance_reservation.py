@@ -545,16 +545,15 @@ class TestClearanceReservation(TransactionCase):
         self.assertEqual(order.clearance_date, original_clearance)
         self.assertFalse(order.clearance_last_demotion_reason, "cleared once genuinely re-paid")
 
-    def test_partial_refund_demotes_to_order_pick_but_keeps_active_payment(self):
-        """Distinct from a full refund: when only PART of what was paid is
-        reversed, the order still demotes no further than Order/Pick (same
-        policy either way, same code path) — but _has_active_payment()
-        must still register that some genuine money remains paid, since
-        that's exactly what decides whether a LATER, complete loss of
-        payment gets its own distinct "no active payment remains" note
-        (see _demote_from_ship_if_unpaid) rather than being silently
-        indistinguishable from this partial case.
-        """
+    def test_partial_refund_under_full_amount_does_not_demote(self):
+        """_is_fully_paid() compares by NET amount, not "any settled
+        refund at all" (see its own docstring) — a refund that doesn't
+        reach the FULL amount actually paid must leave the order still
+        considered fully paid, so it must NOT demote from Ship at all.
+        Only a refund reaching the full paid amount (the separate
+        full-refund test above) actually triggers a demotion. Confirmed
+        here with a real, live partial (half) refund rather than just
+        reasoning about the formula."""
         self._set_stock(10)
         order = self._make_order(self.partner_a, 10)
         order.order_line.price_unit = 100.0
@@ -570,14 +569,20 @@ class TestClearanceReservation(TransactionCase):
         ).create({"payment_date": fields.Date.today()})
         register._create_payments()
 
-        self.assertFalse(order._is_fully_paid(), "a settled refund, even partial, must reverse full-paid status")
-        self.assertTrue(order._has_active_payment(), "half the payment is still genuinely active")
-        self.assertEqual(
-            order.fulfillment_stage, "order_pick",
-            "demotes from Ship to Order/Pick, same as a full refund would",
+        self.assertTrue(
+            order._is_fully_paid(),
+            "a refund under the full paid amount must still count as fully paid, by net amount",
         )
-        self.assertEqual(order.clearance_date, original_clearance, "clearance_date untouched")
-        self.assertEqual(order.clearance_last_demotion_reason, "Refund settled")
+        self.assertTrue(order._has_active_payment())
+        self.assertEqual(
+            order.fulfillment_stage, "ship",
+            "must NOT demote at all — only a refund reaching the full paid amount does",
+        )
+        self.assertEqual(order.clearance_date, original_clearance)
+        self.assertFalse(
+            order.clearance_last_demotion_reason,
+            "nothing to demote, so no reason should ever be recorded",
+        )
 
     def test_backup_restored_precisely_not_a_fresh_stamp_on_recompute(self):
         """Regression: a later rework of the payment hook (to let a
