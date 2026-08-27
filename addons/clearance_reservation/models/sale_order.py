@@ -845,10 +845,25 @@ class SaleOrder(models.Model):
         # this method without turning into O(competing orders) database
         # writes on every single event — most calls land here and do
         # nothing but a couple of cheap re-checks below.
+        #
+        # One case this must NOT skip: a Ship-leg move that just reached
+        # Output via Odoo's own native move-chaining (completing its
+        # origin Pick) arrives here already "assigned" — genuinely, with
+        # nothing for this method to reassign — but still needs its
+        # is_locked_reservation flag actually set, which only happens in
+        # the loop below. Unlike hard-lock/force-reserve (flagged the
+        # moment their own toggle fires, well before any fast path could
+        # ever race them), nothing else ever flags an Output-arrived move,
+        # so the fast path must fall through for it at least once.
+        needs_output_flag = any(
+            self._clearance_is_output_move(m) and not m.is_locked_reservation
+            for m in all_moves
+        )
         if (
             all_moves and all(m.state == "assigned" for m in all_moves)
             and not foreign_moves
             and not far_future_moves.filtered(lambda m: m.state == "assigned")
+            and not needs_output_flag
         ):
             return {"order_count": len(orders), "reserved_move_count": 0}
 
