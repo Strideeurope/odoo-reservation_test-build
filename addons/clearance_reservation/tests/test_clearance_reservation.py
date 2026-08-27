@@ -4,7 +4,7 @@ from unittest.mock import patch
 from dateutil.relativedelta import relativedelta
 
 from odoo import fields
-from odoo.exceptions import UserError
+from odoo.exceptions import AccessError, UserError
 from odoo.tests import tagged
 from odoo.tests.common import TransactionCase
 
@@ -207,6 +207,18 @@ class TestClearanceReservation(TransactionCase):
         register._create_payments()
         return invoice
 
+    def _make_unprivileged_user(self):
+        """An ordinary internal user, deliberately NOT in
+        group_reservation_override (only base.group_system carries that
+        implied) — the negative case for every permission-gated action
+        this module adds."""
+        return self.env["res.users"].create({
+            "name": "No Override Rights",
+            "login": "no_override_rights_test_user",
+            "email": "no_override_rights_test_user@example.com",
+            "groups_id": [(6, 0, [self.env.ref("base.group_user").id])],
+        })
+
     def test_force_reserve_flags_already_assigned_move(self):
         """Bug: action_force_reserve() only looked at moves NOT yet
         assigned, so a line with abundant, uncontested stock — already
@@ -223,6 +235,47 @@ class TestClearanceReservation(TransactionCase):
 
         self.assertTrue(line.is_force_reserved)
         self.assertTrue(move.is_locked_reservation)
+
+    def test_force_reserve_from_forecast_resolves_to_sale_line(self):
+        """The forecast report's Force Reserve button only has a
+        stock.move id to work with (line.move_out.id) — this thin RPC
+        entrypoint must resolve to the underlying sale.order.line and
+        reuse action_force_reserve() completely unchanged."""
+        self._set_stock(10)
+        order = self._make_admin_only_order(self.partner_a, 10)
+        move = order.order_line.move_ids
+        self.assertFalse(order.order_line.is_force_reserved)
+
+        move.action_force_reserve_from_forecast()
+
+        order.order_line.invalidate_recordset()
+        move.invalidate_recordset()
+        self.assertTrue(order.order_line.is_force_reserved)
+        self.assertEqual(move.quantity, 10)
+
+    def test_applying_hard_lock_requires_override_permission(self):
+        """Setting a hard lock (not just releasing one) requires
+        group_reservation_override, at both order and line level."""
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        unprivileged = self._make_unprivileged_user()
+        with self.assertRaises(AccessError):
+            order.with_user(unprivileged).write({"is_reservation_hard_locked": True})
+        with self.assertRaises(AccessError):
+            order.order_line.with_user(unprivileged).write({"is_reservation_hard_locked": True})
+
+    def test_applying_force_reserve_requires_override_permission(self):
+        """Force-reserving requires group_reservation_override — both via
+        the direct field write and via action_force_reserve() itself,
+        which checks up front (before its own side-effecting
+        _action_assign call) rather than leaving it to the write() gate."""
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        unprivileged = self._make_unprivileged_user()
+        with self.assertRaises(AccessError):
+            order.order_line.with_user(unprivileged).write({"is_force_reserved": True})
+        with self.assertRaises(AccessError):
+            order.order_line.with_user(unprivileged).action_force_reserve()
 
     def test_force_reserved_line_visible_to_reservation_domain(self):
         """Bug: a line that is ONLY force-reserved (no hard lock, no real
@@ -491,6 +544,40 @@ class TestClearanceReservation(TransactionCase):
         self.assertEqual(order.fulfillment_stage, "ship")
         self.assertEqual(order.clearance_date, original_clearance)
         self.assertFalse(order.clearance_last_demotion_reason, "cleared once genuinely re-paid")
+
+    def test_partial_refund_demotes_to_order_pick_but_keeps_active_payment(self):
+        """Distinct from a full refund: when only PART of what was paid is
+        reversed, the order still demotes no further than Order/Pick (same
+        policy either way, same code path) — but _has_active_payment()
+        must still register that some genuine money remains paid, since
+        that's exactly what decides whether a LATER, complete loss of
+        payment gets its own distinct "no active payment remains" note
+        (see _demote_from_ship_if_unpaid) rather than being silently
+        indistinguishable from this partial case.
+        """
+        self._set_stock(10)
+        order = self._make_order(self.partner_a, 10)
+        order.order_line.price_unit = 100.0
+        invoice = self._pay_order(order)
+        self.assertEqual(order.fulfillment_stage, "ship")
+        original_clearance = order.clearance_date
+
+        refund = invoice._reverse_moves(cancel=False)
+        refund.invoice_line_ids.write({"quantity": refund.invoice_line_ids.quantity / 2})
+        refund.action_post()
+        register = self.env["account.payment.register"].with_context(
+            active_model="account.move", active_ids=refund.ids
+        ).create({"payment_date": fields.Date.today()})
+        register._create_payments()
+
+        self.assertFalse(order._is_fully_paid(), "a settled refund, even partial, must reverse full-paid status")
+        self.assertTrue(order._has_active_payment(), "half the payment is still genuinely active")
+        self.assertEqual(
+            order.fulfillment_stage, "order_pick",
+            "demotes from Ship to Order/Pick, same as a full refund would",
+        )
+        self.assertEqual(order.clearance_date, original_clearance, "clearance_date untouched")
+        self.assertEqual(order.clearance_last_demotion_reason, "Refund settled")
 
     def test_backup_restored_precisely_not_a_fresh_stamp_on_recompute(self):
         """Regression: a later rework of the payment hook (to let a

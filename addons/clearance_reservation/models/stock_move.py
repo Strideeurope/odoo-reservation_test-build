@@ -96,6 +96,17 @@ class StockMove(models.Model):
 
         return super()._do_unreserve()
 
+    def action_force_reserve_from_forecast(self):
+        """Thin RPC entrypoint for the forecast report's own Force Reserve
+        button (see forecasted_details_clearance.js/.xml) — the report's
+        JS only has a stock.move id (line.move_out.id) to work with, not
+        the sale.order.line id directly. Reuses action_force_reserve()
+        completely unchanged: same permission gate, same priority/locking
+        behavior, whether triggered from here or from the order form's
+        own boolean_toggle."""
+        self.ensure_one()
+        self.sale_line_id.action_force_reserve()
+
     def _action_cancel(self):
         locked = self.filtered(
             lambda m: m.is_locked_reservation
