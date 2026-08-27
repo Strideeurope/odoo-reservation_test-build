@@ -678,16 +678,24 @@ class TestClearanceReservation(TransactionCase):
         self.assertTrue(order2.pick_fully_validated, "fully done, no backorder left open")
 
     def test_hard_lock_release_clears_ship_leg_lock_too(self):
-        """Bug: releasing the order-level hard lock only looked at
-        _get_pick_moves() (Pick-type only), so a Ship-leg move that the
+        """Bug (original): releasing the order-level hard lock only looked
+        at _get_pick_moves() (Pick-type only), so a Ship-leg move that the
         same hard lock had flagged is_locked_reservation=True on stayed
-        stuck soft-locked forever after the lock was released.
+        stuck soft-locked forever after the lock was released — the
+        release-cleanup filter must reach every open move on the order,
+        Ship leg included, not just Pick-type ones.
 
-        Uses a normally-confirmed order (real clearance_date via the
-        grace_period window) so the Pick can actually be validated — the
-        hard lock is layered on TOP of that, exercising the "both
-        hard-locked and genuinely queued" combination, which still counts
-        as tier 0 and still needs its Ship-leg flag cleared on release.
+        Product decision (later, see _clearance_is_output_move): once a
+        Ship-leg move actually reaches Output, it's independently
+        protected — release-immune regardless of any other lock — so in
+        THIS warehouse's routing, a genuinely-assigned Ship-leg move is
+        always Output-protected too, on top of whatever hard lock flagged
+        it. The order-level release must still genuinely turn the hard
+        lock off (verified below); the move staying is_locked_reservation
+        afterward now reflects that separate, independent protection, not
+        the original Pick-only-scoping bug — that distinction is exactly
+        what test_releasing_unrelated_hard_lock_does_not_strip_output_
+        protection verifies on its own.
         """
         self._set_stock(10)
         order = self._make_order(self.partner_a, 10)
@@ -703,10 +711,14 @@ class TestClearanceReservation(TransactionCase):
         self.assertTrue(ship_move, "Ship leg should still be open")
 
         order.write({"is_reservation_hard_locked": False})
+        order.invalidate_recordset()
         ship_move.invalidate_recordset()
-        self.assertFalse(
+        self.assertFalse(order.is_reservation_hard_locked, "the order-level lock must genuinely release")
+        self.assertFalse(order.hard_lock_date, "its lock timestamp must clear too")
+        self.assertTrue(
             ship_move.is_locked_reservation,
-            "release must clear the lock flag on the Ship leg too, not just Pick-type moves",
+            "stays locked — this Ship leg has genuinely reached Output, an "
+            "independent protection the hard lock's own release never touches",
         )
 
     def test_output_reached_move_survives_blanket_release_and_gets_locked(self):
