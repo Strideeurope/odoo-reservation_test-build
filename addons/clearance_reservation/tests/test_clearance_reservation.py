@@ -306,28 +306,30 @@ class TestClearanceReservation(TransactionCase):
             order.order_line.with_user(unprivileged).action_force_reserve()
 
     def test_force_reserved_line_visible_to_reservation_domain(self):
-        """Bug: a line that is ONLY force-reserved (no hard lock, no real
-        clearance_date) was completely absent from _reserve_by_clearance's
-        search domain — action_force_reserve() failing once (no stock)
-        meant no later event (quant update, incoming receipt, cron) could
-        ever retry it."""
+        """Bug (original): a line that is ONLY force-reserved (no hard
+        lock, no real clearance_date) was completely absent from
+        _reserve_by_clearance's search domain — action_force_reserve()
+        failing once (no stock) meant no later event (quant update,
+        incoming receipt, cron) could ever retry it.
+
+        action_force_reserve() now sets is_force_reserved=True
+        immediately, regardless of whether anything was actually
+        available to grab at that moment (see the fix for displacing a
+        lower-priority holder) — so the "flagged, but currently holding
+        nothing" state this test is about is reached directly by a
+        single call, no manual simulation step needed any more."""
         self._set_stock(0)
         order = self._make_admin_only_order(self.partner_a, 10)
         line = order.order_line
         line.action_force_reserve()
-        self.assertFalse(line.is_force_reserved, "nothing was available to grab yet")
-        self.assertEqual(line.move_ids.state, "confirmed")
-
-        # Simulate the exact bug precondition: the line is flagged
-        # force-reserved (e.g. from an earlier attempt that briefly
-        # succeeded before losing the stock again) while its move itself
-        # sits completely unreserved.
-        line.write({"is_force_reserved": True})
+        self.assertTrue(line.is_force_reserved, "the flag is set immediately regardless of what's actually available")
+        self.assertEqual(line.move_ids.state, "confirmed", "nothing was actually available to grab yet")
 
         # _set_stock's own quant-update hook triggers _reserve_by_clearance
         # automatically — no explicit call needed, which is exactly the
-        # behavior this test is proving: the fix means this line no longer
-        # needs a fresh manual retry, an ordinary stock event is enough.
+        # behavior this test is proving: the line stays visible to the
+        # search domain, so an ordinary later stock event is enough to
+        # retry it, with no fresh manual force-reserve click required.
         self._set_stock(10)
 
         line.invalidate_recordset()
