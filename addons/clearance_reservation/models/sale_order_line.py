@@ -744,34 +744,42 @@ class SaleOrderLine(models.Model):
         """Bypass the clearance queue entirely for this line's stock moves.
         Works regardless of the order's fulfillment_stage."""
         # Checked here, up front — not left to the write() gate below —
-        # because _action_assign() below actually moves stock before that
-        # write() ever happens; without this, an unauthorized user's click
-        # would still reserve real stock and only fail afterward when the
-        # is_force_reserved flag itself gets set, leaving the reservation
-        # made but unflagged and unlocked.
+        # because the actual reservation attempt below moves stock before
+        # that write() ever happens; without this, an unauthorized user's
+        # click would still reserve real stock and only fail afterward
+        # when the is_force_reserved flag itself gets set, leaving the
+        # reservation made but unflagged and unlocked.
         if not self.env.user.has_group("clearance_reservation.group_reservation_override"):
             raise AccessError("You don't have permission to force-reserve stock.")
         for line in self:
-            unassigned = line.move_ids.filtered(
-                lambda m: m.state in ("confirmed", "waiting", "partially_available")
-            )
-            # _skip_auto_reserve_trigger: the lock (assigned.write below)
-            # applies a moment AFTER this call, not before — without this
-            # flag, stock.move._action_assign's own auto-rebalance hook
-            # could see this reservation as still-unprotected and unreserve
-            # it again before the lock ever gets a chance to apply.
-            unassigned.with_context(_skip_auto_reserve_trigger=True)._action_assign()
-            unassigned.invalidate_recordset(["state"])
-            # Checked against ALL the line's moves, not just the
-            # previously-unassigned subset above: a line with abundant,
-            # uncontested stock is often ALREADY "assigned" the moment the
-            # order is confirmed, before anyone ever clicks this button —
-            # narrowing to `unassigned` here would silently skip locking
-            # (and flagging is_force_reserved) that move entirely, reporting
-            # "nothing force-reserved" for a line that in fact holds stock.
-            assigned = line.move_ids.filtered(lambda m: m.state == "assigned")
+            # Set the flag FIRST, unconditionally — matching the user's
+            # own intent, not computed afterward from a standalone
+            # _action_assign() attempt (the previous design, and a real
+            # bug: found live via the forecast report). That standalone
+            # attempt could only ever grab stock nobody else was already
+            # holding — it could never win this line the reassignment
+            # queue's own blanket-release-then-reassign pass, since that
+            # pass only runs AFTER this write (see write()'s own hook
+            # below), and by then the flag would already be committed
+            # False from the earlier, doomed-to-fail attempt. Setting it
+            # True first means the write() hook's own _reserve_by_clearance
+            # re-run (triggered synchronously by this same assignment)
+            # evaluates this line as genuine T1 priority DURING the real
+            # release, so it can properly displace an existing
+            # LOWER-priority holder's stock — not just grab whatever
+            # happened to already be free.
+            line.is_force_reserved = True
+            # Whatever that re-run just (re)assigned for this line —
+            # lock it. Checked against ALL the line's moves, not just
+            # ones that were unassigned before this call: a line with
+            # abundant, uncontested stock is often already "assigned"
+            # before anyone ever clicks this button, and the re-run's own
+            # fast path can skip re-flagging a move that was already
+            # sitting there correctly assigned. Includes
+            # partially_available too, so a line that only partially won
+            # the reassignment still gets what it did secure protected.
+            assigned = line.move_ids.filtered(lambda m: m.state in ("assigned", "partially_available"))
             assigned.write({"is_locked_reservation": True})
-            line.is_force_reserved = bool(assigned)
 
     def action_force_unlock_reservation(self):
         self.ensure_one()

@@ -236,6 +236,34 @@ class TestClearanceReservation(TransactionCase):
         self.assertTrue(line.is_force_reserved)
         self.assertTrue(move.is_locked_reservation)
 
+    def test_force_reserve_can_displace_a_lower_priority_holder(self):
+        """Bug found live via the forecast report: action_force_reserve()
+        used to decide whether it succeeded from a standalone, one-shot
+        _action_assign() attempt — before the real priority-based
+        reassignment ever ran — so it could only ever grab stock nobody
+        already held. It could never win stock away from an existing
+        LOWER-priority order that was already holding it, even though
+        force-reserve (T1) is supposed to outrank an ordinary uncleared
+        order (T3) for exactly this."""
+        self._set_stock(10)
+        holder = self._make_order(self.partner_a, 10)
+        self.assertEqual(holder.order_line.move_ids.quantity, 10, "the only order so far holds it all")
+
+        challenger = self._make_admin_only_order(self.partner_b, 10)
+        self.assertEqual(challenger.order_line.move_ids.quantity, 0)
+
+        challenger.order_line.action_force_reserve()
+
+        self.assertTrue(challenger.order_line.is_force_reserved)
+        challenger.order_line.move_ids.invalidate_recordset()
+        holder.order_line.move_ids.invalidate_recordset()
+        self.assertEqual(
+            challenger.order_line.move_ids.quantity, 10,
+            "force-reserve must be able to displace an existing lower-priority holder's stock",
+        )
+        self.assertEqual(holder.order_line.move_ids.quantity, 0, "the displaced ordinary order gives it up")
+        self.assertTrue(challenger.order_line.move_ids.is_locked_reservation)
+
     def test_force_reserve_from_forecast_resolves_to_sale_line(self):
         """The forecast report's Force Reserve button only has a
         stock.move id to work with (line.move_out.id) — this thin RPC
