@@ -107,6 +107,20 @@ class StockMove(models.Model):
         self.ensure_one()
         self.sale_line_id.action_force_reserve()
 
+    def action_force_unlock_reservation_from_forecast(self):
+        """Thin RPC entrypoint for the forecast report's own locked
+        Unreserve button, after the user confirms a warning dialog (see
+        forecasted_details_clearance.js) — same id-resolution reason as
+        action_force_reserve_from_forecast above. Reuses
+        action_force_unlock_reservation() completely unchanged: same
+        permission gate as the order form's own toggle. Only ever called
+        by the JS for a Force-Reserved line specifically — hard lock and
+        Output protection have no release path here (or anywhere, for
+        Output) by design, and this method would be the wrong one for
+        those anyway (it only clears is_force_reserved)."""
+        self.ensure_one()
+        self.sale_line_id.action_force_unlock_reservation()
+
     def _action_cancel(self):
         locked = self.filtered(
             lambda m: m.is_locked_reservation

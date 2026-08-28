@@ -281,6 +281,26 @@ class TestClearanceReservation(TransactionCase):
         self.assertTrue(order.order_line.is_force_reserved)
         self.assertEqual(move.quantity, 10)
 
+    def test_force_unlock_from_forecast_resolves_to_sale_line(self):
+        """The forecast report's confirmation-gated Unreserve button (for
+        a Force Reserved line specifically) only has a stock.move id to
+        work with — this thin RPC entrypoint must resolve to the
+        underlying sale.order.line and reuse
+        action_force_unlock_reservation() completely unchanged."""
+        self._set_stock(10)
+        order = self._make_admin_only_order(self.partner_a, 10)
+        move = order.order_line.move_ids
+        move.action_force_reserve_from_forecast()
+        order.order_line.invalidate_recordset()
+        self.assertTrue(order.order_line.is_force_reserved)
+
+        move.action_force_unlock_reservation_from_forecast()
+
+        order.order_line.invalidate_recordset()
+        move.invalidate_recordset()
+        self.assertFalse(order.order_line.is_force_reserved)
+        self.assertFalse(move.is_locked_reservation)
+
     def test_applying_hard_lock_requires_override_permission(self):
         """Setting a hard lock (not just releasing one) requires
         group_reservation_override, at both order and line level."""
